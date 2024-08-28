@@ -16,7 +16,10 @@ limitations under the License.
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/Passes.h"
-#include "tensorflow/compiler/mlir/disc/transforms/PassDetail.h"
+#include "mlir/disc/transforms/PassDetail.h"
+
+// This pass has the same function with 'createDiscCanonicalizerPass'. To
+// remove.
 
 namespace mlir {
 namespace disc_ral {
@@ -47,7 +50,7 @@ struct Canonicalizer : public CanonicalizerBase<Canonicalizer> {
   }
 
   void runOnOperation() override {
-    (void)applyPatternsAndFoldGreedily(getOperation()->getRegions(), patterns);
+    (void)applyPatternsAndFoldGreedily(getOperation(), patterns);
   }
 
   FrozenRewritePatternSet patterns;

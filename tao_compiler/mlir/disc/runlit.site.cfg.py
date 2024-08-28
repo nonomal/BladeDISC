@@ -42,12 +42,12 @@ config.suffixes = ['.td', '.mlir', '.pbtxt']
 
 mlir_tf_tools_dirs = [
     'tensorflow/compiler/mlir',
-    'tensorflow/compiler/mlir/hlo',
-    'tensorflow/compiler/mlir/disc',
+    'tensorflow/compiler/xla/mlir_hlo',
+    'mlir/disc',
     'tensorflow/compiler/mlir/lite',
     'tensorflow/compiler/mlir/tensorflow',
     'tensorflow/compiler/mlir/tfjs',
-    'tensorflow/compiler/mlir/xla',
+    'tensorflow/compiler/mlir/tf2xla',
     'tensorflow/compiler/mlir/tools/kernel_gen',
     'tensorflow/compiler/aot',
     'tensorflow/compiler/xla/service/mlir_gpu',
@@ -73,5 +73,5 @@ lit_config.load_config(
     config,
     os.path.join(
         os.path.join(real_test_srcdir, os.environ['TEST_WORKSPACE'],
-                     'tensorflow/compiler/mlir/disc/runlit.cfg.py')))
+                     'mlir/disc/runlit.cfg.py')))
 # pylint: enable=undefined-variable

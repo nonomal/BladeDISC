@@ -10,14 +10,12 @@
 # limitations under the License.
 
 from io import BytesIO
+import os
 
 import onnx
 import torch
 import torch_blade._torch_blade._backends as _backends
-
-from torch_blade import pass_manager
-from torch_blade import utils
-from torch_blade import tools
+from torch_blade import pass_manager, tools, utils
 from torch_blade.clustering.support_group_conversion import group_to_engine_conversion
 from torch_blade.logging import logger
 
@@ -47,8 +45,8 @@ def _try_cast_graph_integer_inputs_to_i32(graph):
             tools.cast_to_i32_tensor_type(val)
 
 
-def _build_onnx_engine(subgraph, engine_build_func, q_info=None,
-                       dynamic_settings=None, cast_int_to_i32=False):
+def _build_onnx_engine(subgraph, engine_build_func, group_name,
+                       dynamic_settings=None, cast_int_to_i32=False, grp_calib_data=None):
     if cast_int_to_i32:
         _try_cast_graph_integer_inputs_to_i32(subgraph)
 
@@ -58,14 +56,13 @@ def _build_onnx_engine(subgraph, engine_build_func, q_info=None,
     state = _backends.EngineState()
     state.inputs = [_backends.TensorInfo(inp) for inp in graph.inputs()]
     state.outputs = [_backends.TensorInfo(out) for out in graph.outputs()]
+    if grp_calib_data is not None:
+        # TODO (bohua): do some type check
+        state.calib_data = grp_calib_data
 
     # deduplicate only deduplicate outputs variable's
     # would not invalid value_map
     _deduplicate_onnx_graph_outputs(graph)
-
-    # update q_val for `torchscript -> onnx` if needed
-    if q_info is not None:
-        q_info = q_info.generate_through_mapping(value_map)
 
     dynamic_shapes, dynamic_axes = [], None
     if dynamic_settings is not None:
@@ -84,13 +81,22 @@ def _build_onnx_engine(subgraph, engine_build_func, q_info=None,
 
     dyn_proto = pass_manager._export_onnx(graph, dynamic_axes)
     onnx_model = onnx.load_from_string(dyn_proto)
+
+    if tools.read_bool_from_env('TORCH_BLADE_DEBUG_LOG', False):
+        mlir_dump_dir = "dump_dir"
+        if not os.path.exists(mlir_dump_dir):
+            os.makedirs(mlir_dump_dir)
+        onnx_fname = os.path.join(mlir_dump_dir, group_name + ".onnx")
+        with open(onnx_fname, 'wb') as f:
+            f.write(dyn_proto)
+
     if len(onnx_model.graph.node) == 0:
         # input a graph with empty nodes to onnx builder would cause segfault
+        logger.debug("Skip build engine for onnx model without node.")
         return None
-    q_val = q_info.q_val if q_info is not None else {}
 
     state.model_proto = dyn_proto
-    return engine_build_func(dyn_proto, state, dynamic_shapes, q_val)
+    return engine_build_func(dyn_proto, state, dynamic_shapes)
 
 
 def _subgraph_to_bytes(subgraph, group_name):
@@ -123,14 +129,12 @@ def build_onnx_engine(
     module,
     group_id,
     _try_build_onnx_engine,
-    q_info=None,
     disable_fallback=False,
     dynamic_settings=None,
-    cast_int_to_i32=False
+    cast_int_to_i32=False,
+    quantization_calib_file=None,
 ):
-    # q_info passed to this function and `try_cvt_to_onnx_func`
-    # only contains quantization information for each `prim::FusionGroup`
-    def try_cvt_to_onnx_func(c_module, subgraph, group_name, q_info=None):
+    def try_cvt_to_onnx_func(c_module, c_module_lock, subgraph, group_name, grp_calib_data=None):
         # NB: clear all cached memory for onnx tuning
         torch.cuda.empty_cache()
         # NB: some onnx lowering pass would modify the subgraph
@@ -139,25 +143,37 @@ def build_onnx_engine(
         grp_dynamic_settings = (
             [s[subgraph_idx] for s in dynamic_settings] if dynamic_settings else None
         )
+
         try:
             engine_data = _build_onnx_engine(
-                subgraph, _try_build_onnx_engine, q_info, grp_dynamic_settings, cast_int_to_i32
+                subgraph,
+                _try_build_onnx_engine,
+                group_name,
+                grp_dynamic_settings,
+                cast_int_to_i32,
+                grp_calib_data
             )
         except Exception as error:
-            logger.warning(error)
+            logger.warning(f"Building engine exception: {error}")
             return None
 
         if engine_data is None:
+            logger.warning(f"Building engine failed with empty engine binary.")
             return None
 
         group_name = f"{group_id}{group_name}"
-        otype = _register_onnx_engine(
-            c_module,
-            runtime_fallback_subgraph,
-            engine_data,
-            group_name,
-            disable_fallback,
-        )
+        with c_module_lock:
+            otype = _register_onnx_engine(
+                c_module,
+                runtime_fallback_subgraph,
+                engine_data,
+                group_name,
+                disable_fallback,
+            )
         return group_name, otype
 
-    group_to_engine_conversion(module, try_cvt_to_onnx_func, q_info)
+    group_to_engine_conversion(
+        module,
+        try_cvt_to_onnx_func,
+        quantization_calib_file=quantization_calib_file
+    )

@@ -17,6 +17,7 @@ import torch
 from torch_blade import pass_manager, tools
 from torch_blade.config import Config
 from torch_blade.logging import logger
+from torch_blade.quantization import is_fake_quant_op
 from torch_blade.tools import onnx_lower_guard
 
 
@@ -94,7 +95,8 @@ class OnnxBackendChecker:
             if not supported:
                 node_kinds = [n.kind() for n in graph.nodes()]
                 logger.warning(
-                    f"{str(node_kinds)} export to onnx success, but is not supported by the backend: {self._backend_name}"
+                    f"{str(node_kinds)} export to onnx success, but is not supported by "
+                    f"the backend: {self._backend_name}"
                 )
             return supported
         except Exception as error:
@@ -108,7 +110,7 @@ class OnnxBackendTestBed:
     """
 
     def __init__(
-        self, graph, ignore_device, onnx_backend_test_func, backend_name, q_info=None
+        self, graph, ignore_device, onnx_backend_test_func, backend_name
     ):
         # the original graph must not be modified
         self._orig_graph = graph
@@ -192,7 +194,8 @@ class OnnxBackendTestBed:
             ]
         )
 
-        self._fp16_excluded_list = q_info.fp16_excluded_list if q_info else []
+        # todo(bohua.cbh): enable this
+        self._fp16_excluded_list = []
 
     def _is_inplace_kinds(self, node):
         """
@@ -335,6 +338,10 @@ class OnnxBackendTestBed:
                 self._appendNode(inp.node())
                 continue
 
+            if is_fake_quant_op(inp_node_kind):
+                self._appendNode(inp.node())
+                continue
+
             inp_ = self._current_segment.addInput()
             self._orig2segment_value_map[inp] = inp_
             self._segment2orig_value_map[inp_] = inp
@@ -359,9 +366,10 @@ class OnnxBackendTestBed:
             self._add_unsupported(node)
             return False
 
-        # There are some white_list operations regarded as supported, which were given according to prior knowledge.
-        # But they might cause failure when doing onnx2hie exporting. To give users options to use these
-        # white_list, we have defined some configuration flags, such as Config.enable_onnx_shape_white_list.
+        # There are some white_list operations regarded as supported, which were
+        # given according to prior knowledge. But they might cause failure when doing
+        # onnx2hie exporting. To give users options to use these white_list, we have
+        # defined some configuration flags, such as Config.enable_onnx_shape_white_list.
         if node.kind() in self._white_list:
             return True
 
@@ -445,12 +453,12 @@ class OnnxBackendTestBed:
 
 
 def get_unsupported_nodes(
-    graph, onnx_backend_test_func, backend_name, ignore_device=False, q_info=None
+    graph, onnx_backend_test_func, backend_name, ignore_device=False
 ):
     builder = OnnxBackendTestBed(
-        graph, ignore_device, onnx_backend_test_func, backend_name, q_info=q_info
+        graph, ignore_device, onnx_backend_test_func, backend_name
     )
     for node in graph.node_list():
         builder.appendNode(node)
-    hie_unsupported_set = builder.get_unsupported()
-    return hie_unsupported_set
+    unsupported_set = builder.get_unsupported()
+    return unsupported_set

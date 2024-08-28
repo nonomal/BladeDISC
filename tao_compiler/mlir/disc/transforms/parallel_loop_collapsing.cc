@@ -22,12 +22,13 @@
 //===----------------------------------------------------------------------===//
 
 #include "PassDetail.h"
-#include "mlir-hlo/Dialect/lhlo/IR/lhlo_ops.h"
+#include "lhlo/IR/lhlo_ops.h"
 #include "mlir/Dialect/Affine/LoopUtils.h"
-#include "mlir/Dialect/SCF/Passes.h"
-#include "mlir/Dialect/SCF/SCF.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/SCF/Transforms/Passes.h"
 #include "mlir/Dialect/SCF/Utils/Utils.h"
-#include "mlir/Dialect/StandardOps/IR/Ops.h"
+#include "mlir/disc/disc_util.h"
+#include "mlir/disc/transforms/fusion_utils.h"
 
 namespace mlir {
 namespace disc_ral {
@@ -39,6 +40,19 @@ struct ParallelLoopCollapsing
     SmallVector<scf::ParallelOp, 2> innermostPloops;
     getInnermostParallelLoops(getOperation(), innermostPloops);
     for (scf::ParallelOp ploop : innermostPloops) {
+      if (isMemIntensiveOptExperimentalEnabled()) {
+        // The kStitch fusion's parallel loop is formed directly when lowering
+        // roots to loops, if `DISC_MEM_INTENSIVE_OPT_EXPERIMENTAL` is true.
+        lmhlo::FusionOp fusion = ploop->getParentOfType<lmhlo::FusionOp>();
+        if (fusion) {
+          auto fusionTypeAttr =
+              fusion->getAttrOfType<StringAttr>(kDiscFusionTypeAttrName);
+          if (fusionTypeAttr && (fusionTypeAttr.getValue() == "kStitch" ||
+                                 fusionTypeAttr.getValue() == "kTransform")) {
+            continue;
+          }
+        }
+      }
       if (ploop.getInductionVars().size() > 1) {
         std::vector<unsigned> inds(ploop.getInductionVars().size());
         for (unsigned int id = 0; id < ploop.getInductionVars().size(); id++) {
@@ -53,7 +67,8 @@ struct ParallelLoopCollapsing
 };
 }  // namespace
 
-std::unique_ptr<OperationPass<FuncOp>> createDiscParallelLoopCollapsingPass() {
+std::unique_ptr<OperationPass<func::FuncOp>>
+createDiscParallelLoopCollapsingPass() {
   return std::make_unique<ParallelLoopCollapsing>();
 }
 

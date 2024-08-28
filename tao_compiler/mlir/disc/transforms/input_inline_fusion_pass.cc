@@ -17,9 +17,8 @@ limitations under the License.
 //
 #include <limits>
 
-#include "mlir-hlo/Dialect/lhlo/IR/lhlo_ops.h"
-#include "mlir-hlo/Dialect/lhlo/transforms/map_lmhlo_to_scalar_op.h"
-#include "mlir/Dialect/StandardOps/IR/Ops.h"
+#include "lhlo/IR/lhlo_ops.h"
+#include "lhlo/transforms/map_lmhlo_to_scalar_op.h"
 #include "mlir/IR/Attributes.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
@@ -30,11 +29,11 @@ limitations under the License.
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/Passes.h"
-#include "tensorflow/compiler/mlir/disc/IR/lhlo_disc_ops.h"
-#include "tensorflow/compiler/mlir/disc/transforms/PassDetail.h"
-#include "tensorflow/compiler/mlir/disc/transforms/fusion_utils.h"
-#include "tensorflow/compiler/mlir/disc/transforms/input_inline_fusion_pattern.h"
-#include "tensorflow/compiler/mlir/disc/transforms/lhlo_elemental_utils.h"
+#include "mlir/disc/IR/lhlo_disc_ops.h"
+#include "mlir/disc/transforms/PassDetail.h"
+#include "mlir/disc/transforms/fusion_utils.h"
+#include "mlir/disc/transforms/input_inline_fusion_pattern.h"
+#include "mlir/disc/transforms/lhlo_elemental_utils.h"
 
 using mlir::memref::LoadOp;
 
@@ -57,7 +56,7 @@ class InputInlineFusion : public InputInlineFusionPassBase<InputInlineFusion> {
 
 // This pass works after LhloLegalizeRootsToParallelLoops pass for the
 // XLA-style fusion codegen.
-std::unique_ptr<OperationPass<FuncOp>> createDiscInputInlineFusionPass() {
+std::unique_ptr<OperationPass<func::FuncOp>> createDiscInputInlineFusionPass() {
   return std::make_unique<InputInlineFusion>();
 }
 
@@ -66,7 +65,7 @@ namespace {
 constexpr unsigned c_MAX_ITERATION = 4096 * 1000;
 
 void InputInlineFusion::runOnOperation() {
-  FuncOp func = getOperation();
+  func::FuncOp func = getOperation();
   auto* context = &this->getContext();
   RewritePatternSet patterns(context);
   patterns.insert<InputInlineFusionPattern>(context);
@@ -80,17 +79,17 @@ void InputInlineFusion::runOnOperation() {
   }
 
   // there should be no lmhlo ops after inline fusion,
-  // except for the ConstOp of ColReduction, which for now cannot be
+  // except for the ConstantOp of ColReduction, which for now cannot be
   // properly optimized by general DCE pass
   std::vector<Operation*> to_be_removed;
   func.walk([&](FusionOp fusion) {
-    if (isStitchFusion(fusion.getOperation())) return;
-    fusion.region().walk([&](LmhloOp op) {
+    if (isFusionType<FusionType::kStitch>(fusion.getOperation())) return;
+    fusion.getRegion().walk([&](LmhloOp op) {
       if (isa<TerminatorOp>(op)) {
         return;
       }
-      if (isa<ConstOp>(op)) {
-        // TODO(disc): Check the ConstOp is from ReduceOp
+      if (isa<ConstantOp>(op)) {
+        // TODO(disc): Check the ConstantOp is from ReduceOp
         to_be_removed.push_back(op);
         return;
       }

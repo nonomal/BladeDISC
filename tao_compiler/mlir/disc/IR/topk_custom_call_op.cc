@@ -12,19 +12,18 @@ limitations under the License.
 
 // This file defines topk custom call.
 
-#include "tensorflow/compiler/mlir/disc/IR/topk_custom_call_op.h"
+#include "mlir/disc/IR/topk_custom_call_op.h"
 
-#include "mlir-hlo/Dialect/mhlo/IR/hlo_ops.h"
-#include "mlir/Dialect/StandardOps/IR/Ops.h"
+#include "mhlo/IR/hlo_ops.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/PatternMatch.h"
-#include "tensorflow/compiler/mlir/disc/IR/custom_call_base.h"
-#include "tensorflow/compiler/mlir/disc/IR/disc_ral_ops.h"
-#include "tensorflow/compiler/mlir/disc/IR/hlo_disc_ops.h"
-#include "tensorflow/compiler/mlir/disc/IR/lhlo_disc_ops.h"
-#include "tensorflow/compiler/mlir/disc/transforms/codegen_utils.h"
-#include "tensorflow/compiler/mlir/disc/transforms/placement_utils.h"
+#include "mlir/disc/IR/custom_call_base.h"
+#include "mlir/disc/IR/disc_ral_ops.h"
+#include "mlir/disc/IR/hlo_disc_ops.h"
+#include "mlir/disc/IR/lhlo_disc_ops.h"
+#include "mlir/disc/transforms/codegen_utils.h"
+#include "mlir/disc/transforms/placement_utils.h"
 
 using ::mlir::mhlo_disc::TopKBackendConfig;
 
@@ -53,7 +52,8 @@ LogicalResult reifyReturnTypeShapesImpl<TopKBackendConfig>(
     CustomCallOp op, OpBuilder& builder, ValueRange operands,
     SmallVectorImpl<Value>& reifiedReturnShapes) {
   llvm::Expected<TopKBackendConfig> backend_config =
-      llvm::json::parse<TopKBackendConfig>(op.backend_config());
+      llvm::json::parse<TopKBackendConfig>(
+          op.getBackendConfig().cast<StringAttr>());
   int64_t dimension = backend_config->dimension;
 
   Value keys_operand = operands[0];
@@ -95,7 +95,7 @@ LogicalResult reifyReturnTypeShapesImpl<TopKBackendConfig>(
   k_value = disc_ral::mayConvertToIndexType(k_value, &builder, loc);
   SmallVector<Value> shape_values;
   shape_values.reserve(rank);
-  for (auto element : llvm::enumerate(operand_type.getShape())) {
+  for (const auto& element : llvm::enumerate(operand_type.getShape())) {
     int64_t idx = element.index();
     if (idx == dimension) {
       auto neg_one = builder.create<arith::ConstantIndexOp>(loc, -1);
@@ -133,7 +133,8 @@ LogicalResult lowerToLibraryCallImpl<TopKBackendConfig>(
   }
   // dimension
   llvm::Expected<TopKBackendConfig> backend_config =
-      llvm::json::parse<TopKBackendConfig>(op.backend_config());
+      llvm::json::parse<TopKBackendConfig>(
+          op.getBackendConfig().cast<StringAttr>());
   if (auto e = backend_config.takeError()) {
     return op.emitOpError() << "Problem with parsing topk backend_config: "
                             << llvm::toString(std::move(e));
@@ -145,7 +146,7 @@ LogicalResult lowerToLibraryCallImpl<TopKBackendConfig>(
       rewriter.create<arith::ConstantIntOp>(op.getLoc(), 0, 1));
   on_gpu = placement_utils::isGpuMemRef(op->getOperand(3));
   rewriter.replaceOpWithNewOp<disc_ral::DispatchOp>(
-      op, llvm::None, ctx, newOperands, "ral_dsort",
+      op, TypeRange{}, ctx, newOperands, "ral_dsort",
       /*has_side_effect*/ false,
       /*backend_config*/ on_gpu ? "gpu" : "cpu");
   return success();

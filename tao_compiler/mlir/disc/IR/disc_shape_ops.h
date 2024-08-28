@@ -17,7 +17,6 @@ limitations under the License.
 
 #include "llvm/ADT/StringRef.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
-#include "mlir/Dialect/StandardOps/IR/Ops.h"
 #include "mlir/IR/Attributes.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Dialect.h"
@@ -44,6 +43,6 @@ class DISCShapeDialect : public Dialect {
 }  // end namespace mlir
 
 #define GET_OP_CLASSES
-#include "tensorflow/compiler/mlir/disc/IR/disc_shape_ops.h.inc"
+#include "mlir/disc/IR/disc_shape_ops.h.inc"
 
 #endif  //  TENSORFLOW_COMPILER_MLIR_DISC_IR_DISC_SHAPE_OPS_H_

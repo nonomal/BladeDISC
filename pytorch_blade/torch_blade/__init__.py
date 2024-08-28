@@ -12,7 +12,7 @@
 import torch
 try:
     import torchvision
-except ImportError as e:
+except ImportError:
     pass
 
 from ._torch_blade import *
@@ -24,27 +24,51 @@ import torch_blade.version as version
 import warnings
 
 from torch_blade.config import Config
+from torch_blade.context import default_disc_context, disc_context_guard
 from torch_blade.optimization import optimize
 try:
     import torch_blade.pai_internal
-except ImportError as e:
+except ImportError:
     pass
 
 try:
     import torch_blade.mlir
-except ImportError as e:
+except ImportError:
     pass
 
 try:
     import torch_blade.tensorrt
+except ImportError:
+    pass
+
+try:
+    import torch_blade.neural_engine
 except ImportError as e:
     pass
 
+_is_ltc_available = False
+try:
+    from ._torch_blade import _ltc as ltc
+    _is_ltc_available = True
+except ImportError:
+    pass
+
+if utils.torch_version_number() >= utils.parse_version("2.0.0"):
+    import torch_blade.dynamo
+
+def init_ltc_disc_backend():
+    if _is_ltc_available:
+        torch._C._lazy_ts_backend._init()
+        ltc._init_disc_backend()
+    else:
+        raise RuntimeError('''LTC Disc accelerator is not released in the
+current TorchBlade version, please update to the latest.''')
 
 warnings.filterwarnings("ignore")
 
 utils.add_method(torch._C.ScriptModule)(tools.create_method_from_graph)
 utils.add_method(torch._C.ScriptModule)(tools.unsafe_remove_method)
+utils.add_method(torch._C.ScriptModule)(tools.unsafe_remove_type_attribute)
 utils.add_method(torch._C.ScriptModule, "register_attribute")(tools.register_attr)
 utils.add_method(torch._C.Graph, "createGetAttr")(tools.graph_create_get_attr)
 torch._C.Graph.node_list = utils.listify(torch._C.Graph.nodes)

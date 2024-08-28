@@ -9,12 +9,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from contextlib import ContextDecorator
-from collections import defaultdict
 import copy
 import threading
+from collections import defaultdict
+from contextlib import ContextDecorator
+from enum import Enum
+from typing import List, Optional, Tuple
 
+import torch
 import torch_blade._torch_blade._backends as _backends
+
 
 class OptPipelines:
 
@@ -24,6 +28,17 @@ class OptPipelines:
     def register_pipeline(cls, name, func):
         assert name not in cls.pipelines, f"The pipeline {name} had already registered"
         cls.pipelines[name] = func
+
+
+class QuantizationType(Enum):
+    static = 'static'
+    weight_only = 'weight_only'
+
+    @classmethod
+    def _missing_(cls, value):
+        supported_types = [e.value for e in cls]
+        raise ValueError(f"Unsupported quantization type. Support list: "
+                         f"{supported_types}. Got: '{value}'")
 
 
 def _check_dynamic_ranges(val):
@@ -70,6 +85,15 @@ def _validate_extra_dynamic_ranges(val):
     return val
 
 
+def _validate_dynamic_inputs(val):
+    if isinstance(val, dict):
+        val = [val]
+    assert isinstance(val, list), "dynamic inputs must be Dict or List of Dict"
+    for v in val:
+        assert "min" in v and "max" in v and "opts" in v, "min/max/opt should be set for dynamic inputs."
+    return val
+
+
 class ConfigContext(ContextDecorator):
     context = threading.local()
     context.dict = defaultdict(list)
@@ -83,6 +107,9 @@ class ConfigContext(ContextDecorator):
 
     @classmethod
     def get_contexts(cls):
+        if not hasattr(cls.context, 'dict'):
+            cls.context.dict = defaultdict(list)
+
         # no race-condition here, cls.context is a thread-local object
         # be sure not to override contexts in a subclass however!
         return cls.context.dict[cls.__name__]
@@ -98,6 +125,7 @@ class ConfigContext(ContextDecorator):
     def clone(self):
         return copy.deepcopy(self)
 
+ArgAnnotation = Tuple[List[int], Optional[torch.dtype]]
 
 class Config(ConfigContext):
     """
@@ -124,6 +152,11 @@ class Config(ConfigContext):
         self._fp16_fallback_op_ratio = 0.0
         # Allow BladeDISC to do some AMP optimization if set.
         self._enable_fp16 = False
+        # determine whether quantization is enabled
+        self._enable_int8 = False
+        # determine the kind of quantization, only static/dynamic dynamic quantization
+        # is supported.
+        self._quantization_type = QuantizationType.static
         # Controls the extent that BladeDISC is allowed to use fast math for
         # acceleration. Higher number usually means faster speed while it may
         # lead to some accuracy loss in some cases.
@@ -133,6 +166,13 @@ class Config(ConfigContext):
         #   Level 3: Level 2 + NoNaNs + NoSignedZeros
         #   Level 4: Level 3 + fully llvm fast math
         self._disc_cpu_fast_math_level = 4
+        # Note that default cluster max_iter_count number has risk of early stopping before
+        # cluster final convergence. If this phenomenon happens and it drastically influence
+        # the latency, user can try to enlarge this number.
+        self._disc_cluster_max_iter_count = 10
+        # Ahead of time compile for multi cuda compute_capacity..
+        # Note that it will take longer time to optimize when the flag is on.
+        self._disc_compile_for_multi_cuda_targets = True
         # min/max/opt settings for tuning trt engines with dynamic input shapes
         # looks like:
         # {
@@ -148,15 +188,27 @@ class Config(ConfigContext):
         # Also, you can pass multiple dynamic input shapes if single configure does not give satisfied
         # performance, like config.dynamic_tuning_shapes = [configure1, configure2, ...].
         self._dynamic_tuning_shapes = {}
+        # For some torchscripts exported by torch.jit.script,the format of the input may be very complex,
+        # for example, Dict. In this case, it is not easy or even possible to set tuning shapes through
+        # List. So this config allows users to directly pass inputs corresponding to min/max/opts
+        self._dynamic_tuning_inputs = {}
         self._extra_dynamic_tuning_shapes = {}
+        self._quantization_calibration_data = None
         self._preserved_attributes = []
         self._customize_onnx_opset_version = None
+        self._disable_optimization_for_inference = False
         self._enable_force_to_cuda = False
         self._enable_onnx_shape_white_list = True
+        self._enable_static_shape = False
+        self._freeze_module = True
         self._customize_op_white_list = []
         self._customize_op_black_list = []
         self._customize_jit_passes = []
         self._opt_pipeline = 'DISC'
+        # TODO(tanyo): merge dynamic_tuning_shapes and annotate_args
+        self._annotate_args: List[Optional[ArgAnnotation]] = []
+        self._experimental_subgraph_conversion_parallelism = 1
+        self._force_gpu_constants_to_device = ''
 
     @property
     def optimization_pipeline(self):
@@ -167,6 +219,34 @@ class Config(ConfigContext):
         """
         return self._opt_pipeline
 
+    @property
+    def disable_optimization_for_inference(self):
+        """The flag to disable optimization for inference.
+
+        :type: bool
+        :default: False
+        """
+        return self._disable_optimization_for_inference
+    
+    @property
+    def freeze_module(self):
+        """The flag to freeze module.
+
+        :type: bool
+        :default: True
+        """
+        return self._freeze_module
+    
+    @freeze_module.setter
+    def freeze_module(self, val):
+        assert isinstance(val, bool), "freeze_module should be bool, got {}".format(type(val))
+        self._freeze_module = val
+
+    @disable_optimization_for_inference.setter
+    def disable_optimization_for_inference(self, val):
+        assert isinstance(val, bool), "disable_optimization_for_inference should be bool, got {}".format(type(val))
+        self._disable_optimization_for_inference = val
+
     @optimization_pipeline.setter
     def optimization_pipeline(self, val):
         assert isinstance(val, str), "optimization_pipeline should be str, got {}".format(type(val))
@@ -175,7 +255,7 @@ class Config(ConfigContext):
 
     @property
     def enable_onnx_shape_white_list(self):
-        """The flag is used to force convert shape aten operations to TensorRT. Currently the list contains, 
+        """The flag is used to force convert shape aten operations to TensorRT. Currently the list contains,
         'aten::view', 'aten::size', 'aten::reshape', 'aten::floor_divide', 'aten::Int', 'prim::NumToTensor'.
 
         :type: bool
@@ -204,6 +284,20 @@ class Config(ConfigContext):
         self._fp16_fallback_op_ratio = val
 
     @property
+    def enable_static_shape(self):
+        """The flag to enable static_shape
+
+        :type: bool
+        :default: False
+        """
+        return self._enable_static_shape
+
+    @enable_static_shape.setter
+    def enable_static_shape(self, val):
+        assert isinstance(val, bool), "enable_static_shape should be bool, got {}".format(type(val))
+        self._enable_static_shape = val
+
+    @property
     def enable_mlir_amp(self):
         """[Deprecated] Please use enable_fp16.
         The flag to enable mlir amp.
@@ -218,7 +312,6 @@ class Config(ConfigContext):
         assert isinstance(val, bool), "enable_mlir_amp should be bool, got {}".format(type(val))
         self._enable_fp16 = val
 
-
     @property
     def enable_fp16(self):
         """The flag to enable amp(aka fp16).
@@ -232,6 +325,36 @@ class Config(ConfigContext):
     def enable_fp16(self, val):
         assert isinstance(val, bool), "enable_fp16 should be bool, got {}".format(type(val))
         self._enable_fp16 = val
+
+    @property
+    def enable_int8(self):
+        """The flag to enable quantization(aka int8).
+
+        :type: bool
+        :default: False
+        """
+        return self._enable_int8
+
+    @enable_int8.setter
+    def enable_int8(self, val):
+        assert isinstance(val, bool), "enable_int8 should be bool, got {}".format(type(val))
+        self._enable_int8 = val
+
+    @property
+    def quantization_type(self):
+        """Types of quantization, the following types are supported:
+        static: Both activations & weights are quantized to low bit and the execution
+                process is done on low bit representation.
+        weight-only: Only the weights are quantized to low bit, and they are de-quantized
+                to high bit on-the-fly. The execution process is done on high bit
+                representation. This type of quantization is mainly used to save memory
+                consumption during inference process (especially for big language models).
+        """
+        return self._quantization_type
+
+    @quantization_type.setter
+    def quantization_type(self, val):
+        self._quantization_type = QuantizationType(val)
 
     @property
     def disc_cpu_fast_math_level(self):
@@ -254,8 +377,39 @@ class Config(ConfigContext):
         self._disc_cpu_fast_math_level = val
 
     @property
+    def disc_compile_for_multi_cuda_targets(self):
+        """The flag to enable multi_cc commpilation.
+
+        # Ahead of time compile for multi cuda compute_capacity..
+        # Note that it will take longer time to optimize when the flag is on.
+
+        :type: bool
+        :default: True
+        """
+        return self._disc_compile_for_multi_cuda_targets
+
+    @disc_compile_for_multi_cuda_targets.setter
+    def disc_compile_for_multi_cuda_targets(self, val):
+        assert isinstance(val, bool), "disc_compile_for_multi_cuda_targets should be bool, got {}".format(type(val))
+        self._disc_compile_for_multi_cuda_targets = val
+
+    @property
+    def disc_cluster_max_iter_count(self):
+        """The flag to set number of max_iter_count.
+
+        :type: int
+        :default: 10
+        """
+        return self._disc_cluster_max_iter_count
+
+    @disc_cluster_max_iter_count.setter
+    def disc_cluster_max_iter_count(self, val):
+        assert isinstance(val, int), "disc_cluster_max_iter_count should be int, got {}".format(type(val))
+        self._disc_cluster_max_iter_count = val
+
+    @property
     def dynamic_tuning_shapes(self):
-        """The dynamic shapes configuration for TensorRT & TVM tuning
+        """The dynamic shapes configuration for TensorRT tuning
 
         :type: dict or List of dict
 
@@ -300,6 +454,23 @@ class Config(ConfigContext):
     def dynamic_tuning_shapes(self, val):
         val = _validate_dynamic_ranges(val)
         self._dynamic_tuning_shapes = val
+
+    @property
+    def dynamic_tuning_inputs(self):
+        return self._dynamic_tuning_inputs
+
+    @dynamic_tuning_inputs.setter
+    def dynamic_tuning_inputs(self, val):
+        val = _validate_dynamic_inputs(val)
+        self._dynamic_tuning_inputs = val
+
+    @property
+    def quantization_calibration_data(self):
+        return self._quantization_calibration_data
+
+    @quantization_calibration_data.setter
+    def quantization_calibration_data(self, val):
+        self._quantization_calibration_data = val
 
     @property
     def extra_dynamic_tuning_shapes(self):
@@ -351,14 +522,31 @@ class Config(ConfigContext):
     @customize_onnx_opset_version.setter
     def customize_onnx_opset_version(self, version):
         import torch
-        from torch.onnx.symbolic_helper import _default_onnx_opset_version, _onnx_stable_opsets
         TORCH_VERSION = tuple(int(x) for x in torch.__version__.split(".")[:2])
         if TORCH_VERSION < (1, 8):
-            from torch.onnx.symbolic_helper import _onnx_master_opset
-        else:
-            from torch.onnx.symbolic_helper import _onnx_main_opset
+            from torch.onnx.symbolic_helper import (
+                _default_onnx_opset_version,
+                _onnx_master_opset,
+                _onnx_stable_opsets
+            )
+        elif TORCH_VERSION < (1, 12):
+            from torch.onnx.symbolic_helper import (
+                _default_onnx_opset_version,
+                _onnx_main_opset,
+                _onnx_stable_opsets
+            )
             _onnx_master_opset = _onnx_main_opset
-        assert version == _default_onnx_opset_version or version in _onnx_stable_opsets + [_onnx_master_opset]
+        elif TORCH_VERSION < (1, 13):
+            from torch.onnx._constants import onnx_default_opset as _default_onnx_opset_version
+            from torch.onnx._constants import onnx_main_opset as _onnx_master_opset
+            from torch.onnx._constants import onnx_stable_opsets as _onnx_stable_opsets
+        else:
+            from torch.onnx._constants import ONNX_DEFAULT_OPSET, ONNX_MAX_OPSET, ONNX_MIN_OPSET
+            _default_onnx_opset_version = ONNX_DEFAULT_OPSET
+            _onnx_stable_opsets = range(ONNX_MIN_OPSET, ONNX_MAX_OPSET)
+            _onnx_master_opset = ONNX_MAX_OPSET
+
+        assert version == _default_onnx_opset_version or version in list(_onnx_stable_opsets) + [_onnx_master_opset]
         self._customize_onnx_opset_version = version
 
     @classmethod
@@ -455,3 +643,40 @@ class Config(ConfigContext):
     def customize_jit_passes(self, val):
         assert isinstance(val, list), "customize_jit_passes should be list, got {}".format(type(val))
         self._customize_jit_passes = val
+
+    @property
+    def annotate_args(self):
+        return self._annotate_args
+
+    @annotate_args.setter
+    def annotate_args(self, val):
+        assert isinstance(val, list), "annotate_args should be list, got {}".format(type(val))
+        for i, v in enumerate(val):
+            assert isinstance(v, tuple), "annotate_args[{}] should be tuple, got{}".format(i, type(v))
+        self._annotate_args = val
+
+    @property
+    def experimental_subgraph_conversion_parallelism(self):
+        """The number of threads used for subgraph conversion(aka compiling subgraphs to backends).
+        By default, conversion is performed in a single thread.
+        """
+        assert isinstance(self._experimental_subgraph_conversion_parallelism, int)
+        return self._experimental_subgraph_conversion_parallelism
+
+    @experimental_subgraph_conversion_parallelism.setter
+    def experimental_subgraph_conversion_parallelism(self, val):
+        assert isinstance(val, int), \
+            "experimental_subgraph_conversion_parallelism should be int, got {}".format(type(val))
+        self._experimental_subgraph_conversion_parallelism = val
+
+    @property
+    def force_gpu_constants_to_device(self):
+        """Force to move all prim::Constant on multiple CUDA devices in the model to this device.
+        """
+        return self._force_gpu_constants_to_device
+
+    @force_gpu_constants_to_device.setter
+    def force_gpu_constants_to_device(self, val):
+        assert isinstance(val, str), "device should be str, got {}".format(type(val))
+        assert val.startswith('cuda:') or val == "cuda", "device should be cuda device, got {}".format(val)
+        self._force_gpu_constants_to_device = val

@@ -12,9 +12,11 @@ limitations under the License.
 
 // This file defines the operations used in the LMHLO DISC dialect.
 
-#include "tensorflow/compiler/mlir/disc/IR/lhlo_disc_ops.h"
+#include "mlir/disc/IR/lhlo_disc_ops.h"
 
 #include <unordered_set>
+
+#include "mlir/disc/IR/lhlo_disc_enums.cc.inc"
 
 namespace mlir {
 namespace lmhlo_disc {
@@ -27,7 +29,7 @@ LmhloDiscDialect::LmhloDiscDialect(MLIRContext* context)
     : Dialect(getDialectNamespace(), context, TypeID::get<LmhloDiscDialect>()) {
   addOperations<
 #define GET_OP_LIST
-#include "tensorflow/compiler/mlir/disc/IR/lhlo_disc_ops.cc.inc"
+#include "mlir/disc/IR/lhlo_disc_ops.cc.inc"
 
       >();
   context->loadDialect<memref::MemRefDialect>();
@@ -37,11 +39,12 @@ LmhloDiscDialect::LmhloDiscDialect(MLIRContext* context)
 // CustomCallOp.
 //===----------------------------------------------------------------------===//
 
-static LogicalResult Verify(CustomCallOp op) {
-  if (op.target_arg_mapping()) {
-    lmhlo::CustomCallTargetArgMapping mapping = *op.target_arg_mapping();
+LogicalResult CustomCallOp::verify() {
+  CustomCallOp op = *this;
+  if (op.getTargetArgMapping()) {
+    lmhlo::CustomCallTargetArgMappingAttr mapping = *op.getTargetArgMapping();
     auto verify_mapping = [&](int64_t target_num, size_t op_num,
-                              ArrayAttr mapping,
+                              ::llvm::ArrayRef<int64_t> mapping,
                               StringRef kind) -> LogicalResult {
       if (target_num < op_num)
         return op.emitOpError("number of target " + kind + " (")
@@ -57,8 +60,7 @@ static LogicalResult Verify(CustomCallOp op) {
       std::unordered_set<int64_t> entries;
       // Each entry in the mapping should be < target_num and an entry cannot
       // appear more than once.
-      for (Attribute entry : mapping) {
-        int64_t int_entry = entry.cast<IntegerAttr>().getInt();
+      for (int64_t int_entry : mapping) {
         // ODS verification will ensure that these entries are integers.
         if (!entries.insert(int_entry).second)
           return op.emitOpError("entry ")
@@ -73,11 +75,10 @@ static LogicalResult Verify(CustomCallOp op) {
       }
       return success();
     };
-    if (failed(verify_mapping(mapping.num_args().getInt(), op.args().size(),
-                              mapping.args_to_target_args(), "args")) ||
-        failed(verify_mapping(mapping.num_results().getInt(),
-                              op.output().size(),
-                              mapping.results_to_target_results(), "results")))
+    if (failed(verify_mapping(mapping.getNumArgs(), op.getArgs().size(),
+                              mapping.getArgsToTargetArgs(), "args")) ||
+        failed(verify_mapping(mapping.getNumResults(), op.getOutput().size(),
+                              mapping.getResultsToTargetResults(), "results")))
       return failure();
   }
   return success();
@@ -87,4 +88,4 @@ static LogicalResult Verify(CustomCallOp op) {
 }  // namespace mlir
 
 #define GET_OP_CLASSES
-#include "tensorflow/compiler/mlir/disc/IR/lhlo_disc_ops.cc.inc"
+#include "mlir/disc/IR/lhlo_disc_ops.cc.inc"

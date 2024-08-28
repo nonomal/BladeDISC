@@ -52,25 +52,25 @@ limitations under the License.
 #include <unordered_set>
 #include <utility>
 
+#include "lhlo/IR/lhlo_ops.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Debug.h"
-#include "mlir-hlo/Dialect/lhlo/IR/lhlo_ops.h"
-#include "mlir-hlo/Dialect/mhlo/IR/hlo_ops.h"
-#include "mlir/Dialect/Arithmetic/IR/Arithmetic.h"
+#include "mhlo/IR/hlo_ops.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Shape/IR/Shape.h"
-#include "mlir/Dialect/StandardOps/IR/Ops.h"  // TF:llvm-project
-#include "mlir/Dialect/Tensor/IR/Tensor.h"    // TF:llvm-project
+#include "mlir/Dialect/Tensor/IR/Tensor.h"  // TF:llvm-project
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/MLIRContext.h"  // TF:llvm-project
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/Pass/Pass.h"  // TF:local_config_mlir
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/Passes.h"  // TF:llvm-project
-#include "tensorflow/compiler/mlir/disc/IR/disc_shape_ops.h"
-#include "tensorflow/compiler/mlir/disc/IR/hlo_disc_ops.h"
-#include "tensorflow/compiler/mlir/disc/transforms/PassDetail.h"
-#include "tensorflow/compiler/mlir/disc/transforms/shape_utils.h"
+#include "mlir/disc/IR/disc_shape_ops.h"
+#include "mlir/disc/IR/hlo_disc_ops.h"
+#include "mlir/disc/transforms/PassDetail.h"
+#include "mlir/disc/transforms/shape_utils.h"
 
 namespace mlir {
 namespace disc_ral {
@@ -87,9 +87,9 @@ struct ExtractFromExtentTensorCanonicalizationPattern
 
   LogicalResult matchAndRewrite(tensor::ExtractOp op,
                                 PatternRewriter& rewriter) const override {
-    auto shape_of_op = op.tensor().getDefiningOp<shape::ShapeOfOp>();
+    auto shape_of_op = op.getTensor().getDefiningOp<shape::ShapeOfOp>();
     if (!shape_of_op) return failure();
-    Value index = op.indices().front();
+    Value index = op.getIndices().front();
     rewriter.replaceOpWithNewOp<tensor::DimOp>(op, shape_of_op.getArg(), index);
     return success();
   }
@@ -115,14 +115,14 @@ struct DynamicReshapeOpPartialShapeInference
                                 PatternRewriter& rewriter) const override {
     auto loc = op.getLoc();
     auto output_shape =
-        op.output_shape().getDefiningOp<tensor::FromElementsOp>();
+        op.getOutputShape().getDefiningOp<tensor::FromElementsOp>();
     if (!output_shape) {
       return failure();
     }
     auto result_type = op.getResult().getType().cast<RankedTensorType>();
     SmallVector<int64_t, 4> result_dims(result_type.getRank());
     bool has_uninfered_static_dim = false;
-    for (auto element : llvm::enumerate(output_shape.elements())) {
+    for (const auto& element : llvm::enumerate(output_shape.getElements())) {
       int64_t new_value = -1;
       if (result_type.isDynamicDim(element.index())) {
         if (arith::ConstantIntOp constant_op =
@@ -147,7 +147,7 @@ struct DynamicReshapeOpPartialShapeInference
     }
     auto new_type = result_type.clone(result_dims);
     auto new_op = rewriter.create<mhlo::DynamicReshapeOp>(
-        loc, new_type, op.operand(), output_shape);
+        loc, new_type, op.getOperand(), output_shape);
     rewriter.replaceOpWithNewOp<tensor::CastOp>(op, op.getType(), new_op);
     return success();
   }
@@ -169,14 +169,14 @@ class DynamicReshapeOpShapeInference
 
   LogicalResult matchAndRewrite(mhlo::DynamicReshapeOp op,
                                 PatternRewriter& rewriter) const override {
-    Operation* shape_def_op = op.output_shape().getDefiningOp();
+    Operation* shape_def_op = op.getOutputShape().getDefiningOp();
     if (!shape_def_op) return failure();
     DenseIntElementsAttr cst_attr;
     if (auto cst_shape = dyn_cast<arith::ConstantOp>(shape_def_op)) {
       cst_attr = cst_shape.getValue().dyn_cast_or_null<DenseIntElementsAttr>();
-    } else if (auto mhlo_cst_shape = dyn_cast<mhlo::ConstOp>(shape_def_op)) {
+    } else if (auto mhlo_cst_shape = dyn_cast<mhlo::ConstantOp>(shape_def_op)) {
       cst_attr =
-          mhlo_cst_shape.value().dyn_cast_or_null<DenseIntElementsAttr>();
+          mhlo_cst_shape.getValue().dyn_cast_or_null<DenseIntElementsAttr>();
     }
     if (!cst_attr) return failure();
     auto elem_ty = cst_attr.getType().cast<ShapedType>().getElementType();
@@ -196,7 +196,7 @@ class DynamicReshapeOpShapeInference
         RankedTensorType::get(dims, result_ty.getElementType());
     if (new_ty == result_ty) return failure();
     auto new_reshape = rewriter.create<mhlo::DynamicReshapeOp>(
-        op.getLoc(), new_ty, op.operand(), op.output_shape());
+        op.getLoc(), new_ty, op.getOperand(), op.getOutputShape());
     rewriter.replaceOpWithNewOp<tensor::CastOp>(op, op.getType(), new_reshape);
     return success();
   }
@@ -242,10 +242,12 @@ class DynamicBroadcastInDimOpSimplifier
     }
 
     auto bcastTy = op.getResult().getType().dyn_cast<RankedTensorType>();
-    Value reshapeResult = dynReshapeOp != nullptr ? dynReshapeOp.getResult()
-                                                  : staticReshapeOp.getResult();
+    Value reshapeResult =
+        dynReshapeOp != nullptr
+            ? cast<TypedValue<TensorType>>(dynReshapeOp.getResult())
+            : cast<TypedValue<TensorType>>(staticReshapeOp.getResult());
     auto reshapeTy = reshapeResult.getType().dyn_cast<RankedTensorType>();
-    Value input = dynReshapeOp != nullptr ? dynReshapeOp.getOperand(0)
+    Value input = dynReshapeOp != nullptr ? dynReshapeOp->getOperand(0)
                                           : staticReshapeOp.getOperand();
     auto inputTy = input.getType().dyn_cast<RankedTensorType>();
     if (!bcastTy || !reshapeTy || !inputTy) {
@@ -281,7 +283,7 @@ class DynamicBroadcastInDimOpSimplifier
         if (arith::ConstantIntOp constant_op =
                 dyn_cast_or_null<arith::ConstantIntOp>(dim.getDefiningOp())) {
           staticVal = constant_op.getValue().cast<IntegerAttr>().getInt();
-          assert(staticValue > 0);
+          assert(staticVal > 0);
         } else if (arith::ConstantIndexOp constant_op =
                        dyn_cast_or_null<arith::ConstantIndexOp>(
                            dim.getDefiningOp())) {
@@ -302,7 +304,7 @@ class DynamicBroadcastInDimOpSimplifier
           dynVal = indexCastOp->getOperand(0);
         }
         auto dimOp = dyn_cast_or_null<tensor::DimOp>(dynVal.getDefiningOp());
-        if (!dimOp || dimOp.source() != input) {
+        if (!dimOp || dimOp.getSource() != input) {
           return failure();
         }
         DimValue dimVal;
@@ -320,16 +322,16 @@ class DynamicBroadcastInDimOpSimplifier
     for (std::size_t i = 0; i < inputTy.getRank(); i++) {
       bool matched = false;
       for (; reshapeDimIdx < reshapeTy.getRank() && !matched; reshapeDimIdx++) {
-        // Either both kDynamicSize, or the same static-shape value.
+        // Either both kDynamic, or the same static-shape value.
         if (reshapeDimValues[reshapeDimIdx].value == inputShape[i]) {
           // Check dynamic dim value.
-          if (inputShape[i] == ShapedType::kDynamicSize) {
+          if (inputShape[i] == ShapedType::kDynamic) {
             // It should be the dim-op of input's i-th dim. That is, the `index`
             // of dim-op should be `i`. Note that we already checked that the
             // source of dim-op is the input of reshape.
             auto dimOp = reshapeDimValues[reshapeDimIdx].dynDimOp;
             auto indexOp = dyn_cast_or_null<arith::ConstantIndexOp>(
-                dimOp.index().getDefiningOp());
+                dimOp.getIndex().getDefiningOp());
             if (!indexOp ||
                 indexOp.getValue().cast<IntegerAttr>().getInt() != i) {
               return failure();
@@ -379,9 +381,9 @@ struct ShapeSimplifierPass
 
   void runOnOperation() override;
 
-  LogicalResult applyShapeAnalysis(ShapeAnalysis&, bool&);
+  LogicalResult applyShapeAnalysis(ShapeAnalysisDeprecated&, bool&);
 
-  LogicalResult applySymbolicShapeOptimization(ShapeAnalysis&, bool&);
+  LogicalResult applySymbolicShapeOptimization(ShapeAnalysisDeprecated&, bool&);
 };
 
 void ShapeSimplifierPass::populateShapeRefinerPatterns(
@@ -402,7 +404,7 @@ void ShapeSimplifierPass::populateShapeRefinerPatterns(
 
 void ShapeSimplifierPass::runOnOperation() {
   ModuleOp m = getOperation();
-  FuncOp main = m.lookupSymbol<FuncOp>(entry_func_name_);
+  func::FuncOp main = m.lookupSymbol<func::FuncOp>(entry_func_name_);
   if (!main) {
     m.emitError("entry func: " + entry_func_name_ + " not found");
     signalPassFailure();
@@ -423,7 +425,7 @@ void ShapeSimplifierPass::runOnOperation() {
     (void)applyPatternsAndFoldGreedily(main, std::move(patterns));
 
     // Stage #2: propagate shape information globally
-    ShapeAnalysis analysis(main);
+    ShapeAnalysisDeprecated analysis(main);
     if (failed(analysis.run())) {
       // error message should be generated inside the above function call.
       signalPassFailure();
@@ -454,9 +456,9 @@ void ShapeSimplifierPass::runOnOperation() {
   }
 }
 
-LogicalResult ShapeSimplifierPass::applyShapeAnalysis(ShapeAnalysis& analysis,
-                                                      bool& changed) {
-  FuncOp func = dyn_cast_or_null<FuncOp>(analysis.getOperation());
+LogicalResult ShapeSimplifierPass::applyShapeAnalysis(
+    ShapeAnalysisDeprecated& analysis, bool& changed) {
+  func::FuncOp func = dyn_cast_or_null<func::FuncOp>(analysis.getOperation());
   if (func == nullptr) {
     return failure();
   }
@@ -491,7 +493,7 @@ LogicalResult ShapeSimplifierPass::applyShapeAnalysis(ShapeAnalysis& analysis,
   // 3, refine function type to new type
   auto newFuncTy = FunctionType::get(func.getContext(), refinedInputTypes,
                                      refinedOutputTypes);
-  if (func.getType() != newFuncTy) {
+  if (func.getFunctionType() != newFuncTy) {
     func.setType(newFuncTy);
     changed = true;
   }
@@ -500,8 +502,8 @@ LogicalResult ShapeSimplifierPass::applyShapeAnalysis(ShapeAnalysis& analysis,
 }
 
 LogicalResult ShapeSimplifierPass::applySymbolicShapeOptimization(
-    ShapeAnalysis& analysis, bool& changed) {
-  FuncOp func = dyn_cast_or_null<FuncOp>(analysis.getOperation());
+    ShapeAnalysisDeprecated& analysis, bool& changed) {
+  func::FuncOp func = dyn_cast_or_null<func::FuncOp>(analysis.getOperation());
   if (func == nullptr) {
     return failure();
   }

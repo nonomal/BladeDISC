@@ -13,19 +13,16 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Debug.h"
-#include "mlir-hlo/Dialect/mhlo/IR/hlo_ops.h"
-#include "mlir/Dialect/StandardOps/IR/Ops.h"  // TF:llvm-project
-#include "mlir/IR/MLIRContext.h"              // TF:llvm-project
-#include "mlir/Pass/Pass.h"                   // TF:local_config_mlir
-#include "mlir/Transforms/Passes.h"           // TF:llvm-project
-#include "transforms/PassDetail.h"
-#include "transforms/placement_utils.h"
+#include "mhlo/IR/hlo_ops.h"
+#include "mlir/IR/MLIRContext.h"     // TF:llvm-project
+#include "mlir/Pass/Pass.h"          // TF:local_config_mlir
+#include "mlir/Transforms/Passes.h"  // TF:llvm-project
+#include "mlir/disc/transforms/PassDetail.h"
+#include "mlir/disc/transforms/placement_utils.h"
 
 namespace mlir {
 
-using placement_utils::kCpu;
 using placement_utils::kDiscShapeCalcAttr;
-using placement_utils::kGpu;
 using placement_utils::PlacementType;
 
 namespace disc_ral {
@@ -52,11 +49,12 @@ struct DiscMarkShapeCalc
   // Update marked set.
   // Add some operands of dynamic shape OPs into marked set according to lookup
   // table.
-  void markShapeCalculationOps(FuncOp func, DenseSet<Operation*>& marked_ops);
+  void markShapeCalculationOps(func::FuncOp func,
+                               DenseSet<Operation*>& marked_ops);
 
   // Update marked set.
   // If a OP is in marked set, add all of its operands to marked set.
-  void inferOperands(FuncOp func, llvm::DenseSet<Operation*>& marked_ops);
+  void inferOperands(func::FuncOp func, llvm::DenseSet<Operation*>& marked_ops);
 };
 
 void DiscMarkShapeCalc::runOnOperation() {
@@ -71,7 +69,7 @@ void DiscMarkShapeCalc::MarkShapeCalcOps() {
   Builder builder(&getContext());
   llvm::DenseSet<Operation*> shape_calc_ops;
 
-  mlir::FuncOp func = module.lookupSymbol<mlir::FuncOp>("main");
+  mlir::func::FuncOp func = module.lookupSymbol<mlir::func::FuncOp>("main");
   if (!func) return signalPassFailure();
 
   markShapeCalculationOps(func, shape_calc_ops);
@@ -90,8 +88,24 @@ void DiscMarkShapeCalc::MarkShapeCalcOps() {
   }
 }
 
+// NOTE(lanbo.llb): mhlo.disc op will produce 2 outputs, the 2nd output is i64
+// tensor with single element represent number of valid elements in the 1st
+// output, this will be used to calc the final output shape. It is indeed a
+// shape calc, but where op should not be considered as shape calc op. By
+// marking it as shape calc op will cause mhlo_disc.where impossible to fuse in
+// later fusion pass.
+bool withInputFromWhereOp(Operation* op) {
+  for (Value operand : op->getOperands()) {
+    auto op = operand.getDefiningOp();
+    if (op != nullptr && isa<mhlo_disc::WhereOp>(op)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 void DiscMarkShapeCalc::markShapeCalculationOps(
-    FuncOp func, llvm::DenseSet<Operation*>& marked_ops) {
+    func::FuncOp func, llvm::DenseSet<Operation*>& marked_ops) {
   auto& block = func.getBlocks().front();
   for (Operation& op : block) {
     // TODO(disc): If the operand of the op is a nested FuncOp, mark the
@@ -100,7 +114,8 @@ void DiscMarkShapeCalc::markShapeCalculationOps(
     if (!marked_ops.contains(&op)) {
       // Mark following Ops into shape calculation set
       if (isa<mhlo::GetDimensionSizeOp, tensor::FromElementsOp,
-              tensor::ExtractOp>(&op)) {
+              tensor::ExtractOp>(&op) &&
+          !withInputFromWhereOp(&op)) {
         marked_ops.insert(&op);
         continue;
       }
@@ -121,7 +136,7 @@ void DiscMarkShapeCalc::markShapeCalculationOps(
   };
 }
 
-void DiscMarkShapeCalc::inferOperands(FuncOp func,
+void DiscMarkShapeCalc::inferOperands(func::FuncOp func,
                                       llvm::DenseSet<Operation*>& marked_ops) {
   auto& block = func.getBlocks().front();
   for (auto& op : llvm::make_early_inc_range(
@@ -153,7 +168,9 @@ void DiscMarkShapeCalc::inferOperands(FuncOp func,
         if (ty && ty.hasStaticShape() && ty.getNumElements() > 64) {
           continue;
         }
-        marked_ops.insert(operand);
+        if (!withInputFromWhereOp(&op)) {
+          marked_ops.insert(operand);
+        }
       }
     }
   };

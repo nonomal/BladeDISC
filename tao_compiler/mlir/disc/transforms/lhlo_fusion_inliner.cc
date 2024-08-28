@@ -16,9 +16,9 @@ limitations under the License.
 // This file implements LhloFusionInlinerPass, which inline the body
 // contents of lmhlo.fusion_op after its body is fully lowered.
 //
-#include "mlir-hlo/Dialect/lhlo/IR/lhlo_ops.h"
+#include "lhlo/IR/lhlo_ops.h"
 #include "mlir/Pass/Pass.h"
-#include "tensorflow/compiler/mlir/disc/transforms/PassDetail.h"
+#include "mlir/disc/transforms/PassDetail.h"
 
 namespace mlir {
 namespace disc_ral {
@@ -29,7 +29,7 @@ struct LhloFusionInlinerPass
     : public LhloFusionInlinerPassBase<LhloFusionInlinerPass> {
  public:
   void runOnOperation() override {
-    FuncOp func = getOperation();
+    func::FuncOp func = getOperation();
     SmallVector<FusionOp> worklist;
     func.walk([&](FusionOp fusion) { worklist.push_back(fusion); });
     for (FusionOp fusion : worklist) {
@@ -40,7 +40,7 @@ struct LhloFusionInlinerPass
 
  private:
   void InlineFusion(FusionOp fusion) {
-    Block& block = fusion.region().front();
+    Block& block = fusion.getRegion().front();
     assert(block.getNumArguments() == 0);
     for (Operation& op : llvm::make_early_inc_range(block.getOperations())) {
       if (!isa<lmhlo::TerminatorOp>(&op)) {
@@ -50,7 +50,7 @@ struct LhloFusionInlinerPass
   }
 };
 
-std::unique_ptr<OperationPass<FuncOp>> createLhloFusionInlinerPass() {
+std::unique_ptr<OperationPass<func::FuncOp>> createLhloFusionInlinerPass() {
   return std::make_unique<LhloFusionInlinerPass>();
 }
 

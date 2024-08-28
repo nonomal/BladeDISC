@@ -15,10 +15,8 @@
 
 import io
 import os
-import re
 
 import pkg_resources
-import subprocess
 from setuptools import find_packages, setup
 
 import tensorflow as tf
@@ -26,7 +24,7 @@ import tensorflow as tf
 # Package meta-data.
 NAME_PREFIX = 'blade-disc'
 DESCRIPTION = 'TensorFlow wrapper for Blade DISC compiler.'
-URL = 'https://github.com/pai_disc/aicompiler'
+URL = 'https://https://github.com/alibaba/BladeDISC'
 EMAIL = 'tashuang.zk@alibaba-inc.com'
 AUTHOR = 'Zhu Kai'
 REQUIRES_PYTHON = '>=3.6.0'

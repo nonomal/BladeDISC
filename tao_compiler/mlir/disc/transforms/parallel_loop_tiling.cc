@@ -22,14 +22,16 @@
 //===----------------------------------------------------------------------===//
 
 #include "PassDetail.h"
+#include "lhlo/IR/lhlo_ops.h"
 #include "llvm/ADT/Sequence.h"
-#include "mlir-hlo/Dialect/lhlo/IR/lhlo_ops.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
-#include "mlir/Dialect/SCF/Passes.h"
-#include "mlir/Dialect/SCF/SCF.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/SCF/Transforms/Passes.h"
 #include "mlir/Dialect/SCF/Utils/Utils.h"
-#include "mlir/Dialect/StandardOps/IR/Ops.h"
-#include "tensorflow/compiler/mlir/disc/transforms/codegen_utils.h"
+#include "mlir/disc/disc_util.h"
+#include "mlir/disc/transforms/codegen_utils.h"
+#include "mlir/disc/transforms/fusion_utils.h"
+#include "tensorflow/core/util/env_var.h"
 
 namespace mlir {
 namespace disc_ral {
@@ -59,8 +61,15 @@ struct ParallelLoopTiling
         // TODO: Change this to a assert check after lhlo_fusion pass
         // put even single nodes into a lmhlo.FusionOp
         if (fusion) {
-          if (auto attr =
-                  fusion->getAttrOfType<IntegerAttr>(kThreadPerBlockHint)) {
+          if (isMemIntensiveOptExperimentalEnabled()) {
+            // Do not deal with kStitch fusion.
+            auto fusionTypeAttr =
+                fusion->getAttrOfType<StringAttr>(kDiscFusionTypeAttrName);
+            if (fusionTypeAttr && fusionTypeAttr.getValue() == "kStitch") {
+              continue;
+            }
+          }
+          if (auto attr = fusion->getAttrOfType<IntegerAttr>(kCTASizeHint)) {
             localTileSizes = {attr.getInt()};
           }
         }
@@ -75,7 +84,7 @@ struct ParallelLoopTiling
 
 }  // namespace
 
-std::unique_ptr<OperationPass<FuncOp>> createParallelLoopTilingPass(
+std::unique_ptr<OperationPass<func::FuncOp>> createParallelLoopTilingPass(
     ArrayRef<int64_t> tileSizes, bool withInboundCheck) {
   return std::make_unique<ParallelLoopTiling>(tileSizes, withInboundCheck);
 }

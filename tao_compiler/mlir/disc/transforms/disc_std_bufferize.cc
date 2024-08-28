@@ -13,11 +13,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "mlir-hlo/Dialect/mhlo/IR/hlo_ops.h"
-#include "mlir/Dialect/Arithmetic/IR/Arithmetic.h"
+#include "mhlo/IR/hlo_ops.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/Transforms/Bufferize.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
-#include "mlir/Dialect/StandardOps/IR/Ops.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Attributes.h"
 #include "mlir/IR/Builders.h"
@@ -28,13 +28,13 @@ limitations under the License.
 #include "mlir/IR/Operation.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
-#include "tensorflow/compiler/mlir/disc/transforms/PassDetail.h"
-#include "tensorflow/compiler/mlir/disc/transforms/rewriters.h"
+#include "mlir/disc/transforms/PassDetail.h"
+#include "mlir/disc/transforms/rewriters.h"
 
 namespace mlir {
 namespace disc_ral {
 
-using mhlo::ConstOp;
+using mhlo::ConstantOp;
 
 namespace {
 
@@ -53,7 +53,7 @@ LogicalResult ConstantOpConverter::matchAndRewrite(
   auto resultType = op.getType().dyn_cast<RankedTensorType>();
   if (!resultType) return failure();
 
-  if (resultType.getRank() != 1) return failure();
+  if (resultType.getRank() > 1) return failure();
 
   auto elemType = resultType.getElementType();
   if (!elemType.isIndex() && !elemType.isa<IntegerType>()) return failure();
@@ -62,13 +62,18 @@ LogicalResult ConstantOpConverter::matchAndRewrite(
   DenseElementsAttr attr = op.getValue().cast<DenseElementsAttr>();
   MemRefType bufferType = MemRefType::get({resultType.getShape()}, elemType);
   Value result = rewriter.create<memref::AllocOp>(loc, bufferType);
-  for (auto&& en : llvm::enumerate(attr.getValues<llvm::APInt>())) {
+  for (const auto&& en : llvm::enumerate(attr.getValues<llvm::APInt>())) {
     Value idx = rewriter.create<arith::ConstantIndexOp>(loc, en.index());
     Value val =
         rewriter.create<arith::ConstantIndexOp>(loc, en.value().getSExtValue());
     if (!elemType.isIndex())
       val = rewriter.create<arith::IndexCastOp>(loc, elemType, val);
-    rewriter.create<memref::StoreOp>(loc, val, result, idx);
+    if (resultType.getRank() == 0) {
+      rewriter.create<memref::StoreOp>(loc, val, result);
+    } else {
+      Value idx = rewriter.create<arith::ConstantIndexOp>(loc, en.index());
+      rewriter.create<memref::StoreOp>(loc, val, result, idx);
+    }
   }
 
   rewriter.replaceOp(op, {result});
@@ -128,10 +133,9 @@ void StdBufferizePass::runOnOperation() {
   bufferization::populateBufferizeMaterializationLegality(target);
 
   target.addLegalDialect<memref::MemRefDialect>();
-  target.addLegalOp<FuncOp, ModuleOp>();
-  target
-      .addDynamicallyLegalDialect<StandardOpsDialect, arith::ArithmeticDialect>(
-          [&](Operation* op) { return typeConverter.isLegal(op); });
+  target.addLegalOp<func::FuncOp, ModuleOp>();
+  target.addDynamicallyLegalDialect<arith::ArithDialect>(
+      [&](Operation* op) { return typeConverter.isLegal(op); });
 
   // Setup conversion patterns.
   RewritePatternSet patterns(&ctx);
@@ -142,14 +146,14 @@ void StdBufferizePass::runOnOperation() {
   // clang-format on
 
   // Apply conversion.
-  FuncOp func = getOperation();
+  func::FuncOp func = getOperation();
   if (failed(applyPartialConversion(func, target, std::move(patterns))))
     signalPassFailure();
 }
 
 }  // namespace
 
-std::unique_ptr<OperationPass<FuncOp>> createDiscStdBufferizePass() {
+std::unique_ptr<OperationPass<func::FuncOp>> createDiscStdBufferizePass() {
   return std::make_unique<StdBufferizePass>();
 }
 

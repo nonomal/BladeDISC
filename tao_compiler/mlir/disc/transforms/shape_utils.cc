@@ -9,26 +9,27 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "tensorflow/compiler/mlir/disc/transforms/shape_utils.h"
+#define DEBUG_TYPE "disc-shape-utils"
+
+#include "mlir/disc/transforms/shape_utils.h"
 
 #include <unordered_set>
 #include <utility>
 
+#include "lhlo/IR/lhlo_ops.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Debug.h"
-#include "mlir-hlo/Dialect/lhlo/IR/lhlo_ops.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Shape/IR/Shape.h"
-#include "mlir/Dialect/StandardOps/IR/Ops.h"
-#include "mlir/Dialect/StandardOps/IR/Ops.h"  // TF:llvm-project
-#include "mlir/Dialect/Tensor/IR/Tensor.h"    // TF:llvm-project
+#include "mlir/Dialect/Tensor/IR/Tensor.h"  // TF:llvm-project
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/MLIRContext.h"  // TF:llvm-project
 #include "mlir/IR/OpDefinition.h"
-#include "tensorflow/compiler/mlir/disc/IR/disc_shape_ops.h"
-#include "tensorflow/compiler/mlir/disc/IR/hlo_disc_ops.h"
-#include "tensorflow/compiler/mlir/disc/disc_util.h"
+#include "mlir/disc/IR/disc_shape_ops.h"
+#include "mlir/disc/IR/hlo_disc_ops.h"
+#include "mlir/disc/disc_util.h"
 
 namespace mlir {
 namespace disc_ral {
@@ -49,7 +50,7 @@ LogicalResult SymbolDim::Merge(SymbolDim* other) {
   return success();
 }
 
-Type ShapeAnalysis::getRefinedType(Value value) {
+Type ShapeAnalysisDeprecated::getRefinedType(Value value) {
   SymbolShape* symbolShape = getShape(value);
 
   // not-shaped type
@@ -60,7 +61,7 @@ Type ShapeAnalysis::getRefinedType(Value value) {
   return RankedTensorType::get(dims, ty.getElementType());
 }
 
-LogicalResult ShapeAnalysis::run() {
+LogicalResult ShapeAnalysisDeprecated::run() {
   // Make sure only run once.
   if (initialized) {
     op_->emitError() << "re-initialized shape analysis";
@@ -71,7 +72,7 @@ LogicalResult ShapeAnalysis::run() {
   return buildShapeMap();
 }
 
-LogicalResult ShapeAnalysis::buildShapeMap() {
+LogicalResult ShapeAnalysisDeprecated::buildShapeMap() {
   // Do not merge the region loops. We want to compute shape-map, dim-value-map
   // and decompose one-by-one.
   for (auto& region : op_->getRegions()) {
@@ -94,7 +95,7 @@ LogicalResult ShapeAnalysis::buildShapeMap() {
   return success();
 }
 
-void ShapeAnalysis::postProcessingDimValues() {
+void ShapeAnalysisDeprecated::postProcessingDimValues() {
   // Update dimValue roots.
   for (auto sym2val : dimSymbol2DimValue_) {
     dimSymbol2DimValue_[sym2val.first] = getRootDimValue(sym2val.second);
@@ -169,7 +170,7 @@ void ShapeAnalysis::postProcessingDimValues() {
   dimValueMulDecompose_ = std::move(dimValMulDecomp);
 }
 
-LogicalResult ShapeAnalysis::buildSymbolShape(Value value) {
+LogicalResult ShapeAnalysisDeprecated::buildSymbolShape(Value value) {
   if (shapeMap_.find(value) != shapeMap_.end()) {
     return success();
   }
@@ -191,7 +192,7 @@ LogicalResult ShapeAnalysis::buildSymbolShape(Value value) {
   return success();
 }
 
-LogicalResult ShapeAnalysis::buildRegionShapeMap(Region* region) {
+LogicalResult ShapeAnalysisDeprecated::buildRegionShapeMap(Region* region) {
   // Only SCF is supported a.t.m.
   if (region->getBlocks().size() != 1) {
     return region->getParentOp()->emitError(
@@ -203,7 +204,7 @@ LogicalResult ShapeAnalysis::buildRegionShapeMap(Region* region) {
   return success();
 }
 
-LogicalResult ShapeAnalysis::buildBlockShapeMap(Block* block) {
+LogicalResult ShapeAnalysisDeprecated::buildBlockShapeMap(Block* block) {
   // mapping block arguments
   for (Value value : block->getArguments()) {
     if (failed(buildSymbolShape(value))) {
@@ -226,7 +227,8 @@ LogicalResult ShapeAnalysis::buildBlockShapeMap(Block* block) {
   return success();
 }
 
-LogicalResult ShapeAnalysis::buildOperationShapeValueMap(Operation* op) {
+LogicalResult ShapeAnalysisDeprecated::buildOperationShapeValueMap(
+    Operation* op) {
   auto updateShapeValueEqual = [&](Value lhs, Value rhs) {
     if (!isShapeValueEqual(lhs, rhs)) {
       if (!shapeValueEqual_.isEquivalent(ValueWrapper(lhs),
@@ -269,7 +271,7 @@ LogicalResult ShapeAnalysis::buildOperationShapeValueMap(Operation* op) {
   return success();
 }
 
-LogicalResult ShapeAnalysis::buildOperationShapeMap(Operation* op) {
+LogicalResult ShapeAnalysisDeprecated::buildOperationShapeMap(Operation* op) {
   // build shapes for the results of op
   for (Value result : op->getResults()) {
     if (failed(buildSymbolShape(result))) {
@@ -284,7 +286,7 @@ LogicalResult ShapeAnalysis::buildOperationShapeMap(Operation* op) {
   return applyOpConstraint(op);
 }
 
-LogicalResult ShapeAnalysis::buildRegionDimValueMap(Region* region) {
+LogicalResult ShapeAnalysisDeprecated::buildRegionDimValueMap(Region* region) {
   // Only SCF is supported a.t.m.
   if (region->getBlocks().size() != 1) {
     return region->getParentOp()->emitError(
@@ -297,14 +299,14 @@ LogicalResult ShapeAnalysis::buildRegionDimValueMap(Region* region) {
   return success();
 }
 
-LogicalResult ShapeAnalysis::buildBlockDimValueMap(Block* block) {
+LogicalResult ShapeAnalysisDeprecated::buildBlockDimValueMap(Block* block) {
   // TODO: deal with memref.load and store directory rather than infer from
   // reshape.
   auto extractLmhloValueOfDim = [&](Value valueOfDims, int64_t index,
                                     DimValue& dimValue) {
     // case 1: dimValues are built with alloc and store.
-    //     %0 = memref.alloc() : memref<3xi32, "cpu">
-    //     memref.store %1, %0[%c0] : memref<3xi32, "cpu">
+    //     %0 = memref.alloc() : memref<3xi32>
+    //     memref.store %1, %0[%c0] : memref<3xi32>
     // TODO: there may be more scenarios.
     for (auto user : valueOfDims.getUsers()) {
       if (auto store = dyn_cast_or_null<memref::StoreOp>(user)) {
@@ -315,7 +317,7 @@ LogicalResult ShapeAnalysis::buildBlockDimValueMap(Block* block) {
         int64_t index_val;
         if (getConstIntValue(indices[0].getDefiningOp(), index_val) &&
             index_val == index) {
-          dimValue = DimValue(store.value());
+          dimValue = DimValue(store.getValue());
           return true;
         }
       }
@@ -349,7 +351,7 @@ LogicalResult ShapeAnalysis::buildBlockDimValueMap(Block* block) {
     return false;
   };
   auto getTensorDimValues = [&](Value value) {
-    llvm::Optional<SmallVector<DimValue>> result;
+    std::optional<SmallVector<DimValue>> result;
     auto op = value.getDefiningOp();
     if (auto from_elements = dyn_cast_or_null<tensor::FromElementsOp>(op)) {
       SmallVector<DimValue> dimValues;
@@ -441,6 +443,9 @@ LogicalResult ShapeAnalysis::buildBlockDimValueMap(Block* block) {
           begin = 1;
           end = in_rank - 1;
         }
+        if (begin < 0) {
+          continue;
+        }
         for (int64_t in_idx = begin; in_idx < end; in_idx++) {
           if (in_mapped.contains(in_idx)) {
             continue;
@@ -531,7 +536,7 @@ LogicalResult ShapeAnalysis::buildBlockDimValueMap(Block* block) {
     } else if (auto reinterpret = dyn_cast<memref::ReinterpretCastOp>(*op)) {
       Value result = reinterpret.getResult();
       auto sizes = reinterpret.sizes();
-      for (auto en : llvm::enumerate(sizes)) {
+      for (const auto& en : llvm::enumerate(sizes)) {
         auto dimVal = DimValue(en.value());
         if (failed(buildDimValueMap(result, en.index(), dimVal))) {
           continue;
@@ -563,11 +568,11 @@ LogicalResult ShapeAnalysis::buildBlockDimValueMap(Block* block) {
       mayCreateOrMapConstInt(result);
     } else if (isa<mhlo::DynamicReshapeOp, mhlo::DynamicBroadcastInDimOp>(op)) {
       auto dimValues = getTensorDimValues(op->getOperand(1));
-      if (!dimValues.hasValue()) {
+      if (!dimValues.has_value()) {
         return WalkResult::advance();
       }
       Value result = op->getResult(0);
-      for (auto& val : llvm::enumerate(*dimValues)) {
+      for (const auto& val : llvm::enumerate(*dimValues)) {
         auto& dimVal = val.value();
         if (failed(buildDimValueMap(result, val.index(), dimVal))) {
           continue;
@@ -575,12 +580,12 @@ LogicalResult ShapeAnalysis::buildBlockDimValueMap(Block* block) {
         mayCreateOrMapConstInt(dimVal);
       }
     } else if (auto dynSlice = dyn_cast<mhlo::RealDynamicSliceOp>(*op)) {
-      auto starts = getTensorDimValues(dynSlice.start_indices());
-      auto limits = getTensorDimValues(dynSlice.limit_indices());
-      auto strides = getTensorDimValues(dynSlice.strides());
+      auto starts = getTensorDimValues(dynSlice.getStartIndices());
+      auto limits = getTensorDimValues(dynSlice.getLimitIndices());
+      auto strides = getTensorDimValues(dynSlice.getStrides());
       Value result = op->getResult(0);
       auto out_ty = result.getType().dyn_cast_or_null<RankedTensorType>();
-      if (!starts.hasValue() || !limits.hasValue() || !strides.hasValue() ||
+      if (!starts.has_value() || !limits.has_value() || !strides.has_value() ||
           !out_ty) {
         return WalkResult::advance();
       }
@@ -612,8 +617,9 @@ LogicalResult ShapeAnalysis::buildBlockDimValueMap(Block* block) {
   return success();
 }
 
-LogicalResult ShapeAnalysis::buildDimValueMap(Value operand, int64_t dim,
-                                              DimValue dimValue) {
+LogicalResult ShapeAnalysisDeprecated::buildDimValueMap(Value operand,
+                                                        int64_t dim,
+                                                        DimValue dimValue) {
   auto symbol = getDim(operand, dim);
   if (symbol == nullptr) {
     return failure();
@@ -631,17 +637,19 @@ LogicalResult ShapeAnalysis::buildDimValueMap(Value operand, int64_t dim,
   return success();
 }
 
-SymbolShape* ShapeAnalysis::getShape(Value value) {
+SymbolShape* ShapeAnalysisDeprecated::getShape(Value value) {
   auto it = shapeMap_.find(value);
   if (it == shapeMap_.end()) return nullptr;
 
   for (int64_t i = 0; i < it->second.rank(); ++i) {
     it->second.setSymbolDim(i, getDim(value, i));
   }
+  auto rank = it->second.rank();
+  assert(rank >= 0 && rank <= 1000);
   return &it->second;
 }
 
-SymbolDim* ShapeAnalysis::getRootDim(SymbolDim* symbolDim) {
+SymbolDim* ShapeAnalysisDeprecated::getRootDim(SymbolDim* symbolDim) {
   assert(symbolDim != nullptr);
   SymbolDim* parentSymbolDim = symbolDim;
   do {
@@ -653,10 +661,12 @@ SymbolDim* ShapeAnalysis::getRootDim(SymbolDim* symbolDim) {
   return parentSymbolDim;
 }
 
-SymbolDim* ShapeAnalysis::getDim(Value value, int64_t dim) {
+SymbolDim* ShapeAnalysisDeprecated::getDim(Value value, int64_t dim) {
   auto it = shapeMap_.find(value);
   if (it == shapeMap_.end()) return nullptr;
-
+  if (it->second.rank() <= 0 || dim < 0 || dim > it->second.rank() - 1) {
+    return nullptr;
+  }
   SymbolDim* symbolDim = it->second.getSymbolDim(dim);
   assert(symbolDim != nullptr);
 
@@ -666,11 +676,11 @@ SymbolDim* ShapeAnalysis::getDim(Value value, int64_t dim) {
   return symbolDim;
 }
 
-DimValue ShapeAnalysis::getRootDimValue(DimValue dimValue) {
+DimValue ShapeAnalysisDeprecated::getRootDimValue(DimValue dimValue) {
   return dimValueEquivalence_.getOrInsertLeaderValue(dimValue);
 }
 
-DimValue ShapeAnalysis::getDimValue(SymbolDim* symbolDim) {
+DimValue ShapeAnalysisDeprecated::getDimValue(SymbolDim* symbolDim) {
   if (symbolDim == nullptr) {
     return DimValue(Value(nullptr));
   }
@@ -687,9 +697,9 @@ DimValue ShapeAnalysis::getDimValue(SymbolDim* symbolDim) {
   return rootDimValue;
 }
 
-DimValue ShapeAnalysis::getDimValue(Value operand, int64_t dim) {
+DimValue ShapeAnalysisDeprecated::getDimValue(Value operand, int64_t dim) {
   auto ty = operand.getType().dyn_cast<ShapedType>();
-  if (!ty.hasRank() || dim >= ty.getRank()) {
+  if (!ty.hasRank() || ty.getRank() <= 0 || dim >= ty.getRank() || dim < 0) {
     return DimValue(Value(nullptr));
   }
 
@@ -711,7 +721,8 @@ DimValue ShapeAnalysis::getDimValue(Value operand, int64_t dim) {
   return getDimValue(symbolDim);
 }
 
-LogicalResult ShapeAnalysis::mapDimEqual(SymbolDim* lhs, SymbolDim* rhs) {
+LogicalResult ShapeAnalysisDeprecated::mapDimEqual(SymbolDim* lhs,
+                                                   SymbolDim* rhs) {
   if (lhs == nullptr || rhs == nullptr) {
     return success();
   }
@@ -731,7 +742,8 @@ LogicalResult ShapeAnalysis::mapDimEqual(SymbolDim* lhs, SymbolDim* rhs) {
   }
 }
 
-LogicalResult ShapeAnalysis::mapShapeEqual(SymbolShape* lhs, SymbolShape* rhs) {
+LogicalResult ShapeAnalysisDeprecated::mapShapeEqual(SymbolShape* lhs,
+                                                     SymbolShape* rhs) {
   if (!lhs || !rhs || lhs->rank() != rhs->rank()) return failure();
 
   for (auto&& en : llvm::zip(lhs->getSymbolDims(), rhs->getSymbolDims())) {
@@ -740,7 +752,7 @@ LogicalResult ShapeAnalysis::mapShapeEqual(SymbolShape* lhs, SymbolShape* rhs) {
   return success();
 }
 
-LogicalResult ShapeAnalysis::mapShapeEqual(Value lhs, Value rhs) {
+LogicalResult ShapeAnalysisDeprecated::mapShapeEqual(Value lhs, Value rhs) {
   SymbolShape* lhsShape = getShape(lhs);
   SymbolShape* rhsShape = getShape(rhs);
 
@@ -777,23 +789,24 @@ LogicalResult ShapeAnalysis::mapShapeEqual(Value lhs, Value rhs) {
   return mapShapeEqual(lhsShape, rhsShape);
 }
 
-LogicalResult ShapeAnalysis::mapDimEqual(Value lhs, int64_t lhsIdx, Value rhs,
-                                         int64_t rhsIdx) {
+LogicalResult ShapeAnalysisDeprecated::mapDimEqual(Value lhs, int64_t lhsIdx,
+                                                   Value rhs, int64_t rhsIdx) {
   SymbolDim* lhsDim = getDim(lhs, lhsIdx);
   SymbolDim* rhsDim = getDim(rhs, rhsIdx);
   return mapDimEqual(lhsDim, rhsDim);
 }
 
 // TODO: map const and constOp equal.
-LogicalResult ShapeAnalysis::mapDimValueEqual(DimValue lhs, DimValue rhs) {
+LogicalResult ShapeAnalysisDeprecated::mapDimValueEqual(DimValue lhs,
+                                                        DimValue rhs) {
   if (!dimValueEquivalence_.isEquivalent(lhs, rhs)) {
     dimValueEquivalence_.unionSets(lhs, rhs);
   }
   return success();
 }
 
-bool ShapeAnalysis::isDimEqual(Value lhs, int64_t lhsDim, Value rhs,
-                               int64_t rhsDim) {
+bool ShapeAnalysisDeprecated::isDimEqual(Value lhs, int64_t lhsDim, Value rhs,
+                                         int64_t rhsDim) {
   auto lhs_ty = lhs.getType().dyn_cast<ShapedType>();
   auto rhs_ty = rhs.getType().dyn_cast<ShapedType>();
   if (!lhs_ty.hasRank() || !rhs_ty.hasRank()) {
@@ -813,7 +826,7 @@ bool ShapeAnalysis::isDimEqual(Value lhs, int64_t lhsDim, Value rhs,
          (getDimValue(lhs, lhsDim) == getDimValue(rhs, rhsDim));
 }
 
-SmallVector<std::vector<DimValue>> ShapeAnalysis::getDimDecompose(
+SmallVector<std::vector<DimValue>> ShapeAnalysisDeprecated::getDimDecompose(
     Value value, int64_t index) {
   auto dim_val = getDimValue(value, index);
   auto iter = dimValueMulDecompose_.find(dim_val);
@@ -822,7 +835,7 @@ SmallVector<std::vector<DimValue>> ShapeAnalysis::getDimDecompose(
              : iter->second;
 }
 
-bool ShapeAnalysis::isShapeEqual(Value lhs, Value rhs) {
+bool ShapeAnalysisDeprecated::isShapeEqual(Value lhs, Value rhs) {
   SymbolShape* lhsShape = getShape(lhs);
   SymbolShape* rhsShape = getShape(rhs);
   if (!lhsShape || !lhsShape) return false;
@@ -833,15 +846,15 @@ bool ShapeAnalysis::isShapeEqual(Value lhs, Value rhs) {
   return true;
 }
 
-bool ShapeAnalysis::isShapeValueEqual(Value lhs, Value rhs) {
+bool ShapeAnalysisDeprecated::isShapeValueEqual(Value lhs, Value rhs) {
   return shapeValueEqual_.isEquivalent(ValueWrapper(lhs), ValueWrapper(rhs));
 }
 
-bool ShapeAnalysis::isDimValueEqual(DimValue lhs, DimValue rhs) {
+bool ShapeAnalysisDeprecated::isDimValueEqual(DimValue lhs, DimValue rhs) {
   return dimValueEquivalence_.isEquivalent(lhs, rhs);
 }
 
-LogicalResult ShapeAnalysis::applyOpConstraint(Operation* op) {
+LogicalResult ShapeAnalysisDeprecated::applyOpConstraint(Operation* op) {
   if (op->getDialect() == op->getContext()->getLoadedDialect("tensor")) {
     return applyTensorOpConstraint(op);
   } else if (op->getDialect() == op->getContext()->getLoadedDialect("mhlo") ||
@@ -857,14 +870,14 @@ LogicalResult ShapeAnalysis::applyOpConstraint(Operation* op) {
   return success();
 }
 
-LogicalResult ShapeAnalysis::applyTensorOpConstraint(Operation* op) {
+LogicalResult ShapeAnalysisDeprecated::applyTensorOpConstraint(Operation* op) {
   if (isa<tensor::CastOp>(op)) {
     return mapShapeEqual(op->getResult(0), op->getOperand(0));
   }
   return success();
 }
 
-LogicalResult ShapeAnalysis::applyMhloOpConstraint(Operation* op) {
+LogicalResult ShapeAnalysisDeprecated::applyMhloOpConstraint(Operation* op) {
   if (op->hasTrait<mlir::OpTrait::SameOperandsAndResultType>() ||
       op->hasTrait<mlir::OpTrait::SameOperandsAndResultShape>()) {
     Value ref;
@@ -887,13 +900,13 @@ LogicalResult ShapeAnalysis::applyMhloOpConstraint(Operation* op) {
   if (auto transpose = dyn_cast<mhlo::TransposeOp>(op)) {
     Value operand = op->getOperand(0);
     Value result = op->getResult(0);
-    for (auto& en :
-         llvm::enumerate(transpose.permutation().getValues<int64_t>())) {
+    for (const auto& en :
+         llvm::enumerate(transpose.getPermutation().getValues<int64_t>())) {
       mapDimEqual(operand, en.value(), result, en.index());
     }
   } else if (auto concat = dyn_cast<mhlo::ConcatenateOp>(op)) {
     Value result = op->getResult(0);
-    int64_t axis = concat.dimension();
+    int64_t axis = concat.getDimension();
     int64_t rank = result.getType().cast<RankedTensorType>().getRank();
     for (Value operand : op->getOperands()) {
       for (int64_t i = 0; i < rank; ++i) {
@@ -907,7 +920,7 @@ LogicalResult ShapeAnalysis::applyMhloOpConstraint(Operation* op) {
     int64_t rank = operand.getType().cast<RankedTensorType>().getRank();
     int64_t resultDimIdx = 0;
     for (int64_t i = 0; i < rank; ++i) {
-      auto reduceDims = reduce.dimensions().getValues<int64_t>();
+      auto reduceDims = reduce.getDimensions().getValues<int64_t>();
       if (std::find(reduceDims.begin(), reduceDims.end(), i) !=
           reduceDims.end()) {
         continue;
@@ -920,8 +933,8 @@ LogicalResult ShapeAnalysis::applyMhloOpConstraint(Operation* op) {
     Value result = op->getResult(0);
     auto ty = operand.getType().dyn_cast<ShapedType>();
     assert(ty);
-    for (auto& dim : llvm::enumerate(
-             broadcast_in_dim.broadcast_dimensions().getValues<int64_t>())) {
+    for (const auto& dim : llvm::enumerate(
+             broadcast_in_dim.getBroadcastDimensions().getValues<int64_t>())) {
       // Deal with non-static & non-one dim.
       if (!ty.isDynamicDim(dim.index()) && ty.getDimSize(dim.index()) != 1) {
         mapDimEqual(operand, dim.index(), result, dim.value());
@@ -948,7 +961,7 @@ LogicalResult ShapeAnalysis::applyMhloOpConstraint(Operation* op) {
   } else if (auto dot_general = dyn_cast<mhlo::DotGeneralOp>(op)) {
     Value lhs = op->getOperand(0);
     Value rhs = op->getOperand(1);
-    auto dim_numbers = dot_general.dot_dimension_numbers();
+    auto dim_numbers = dot_general.getDotDimensionNumbers();
     DenseSet<int64_t> lhs_contract_batch_dims;
     DenseSet<int64_t> rhs_contract_batch_dims;
     // Contracting dimensions.
@@ -999,7 +1012,7 @@ LogicalResult ShapeAnalysis::applyMhloOpConstraint(Operation* op) {
                   i + lhs_batching_dims.size());
     }
   } else if (auto einsum = dyn_cast<mhlo::EinsumOp>(op)) {
-    StringRef equation = einsum.einsum_config();
+    StringRef equation = einsum.getEinsumConfig();
     llvm::SmallDenseMap<char, llvm::SmallDenseMap<EquationVariable, size_t>>
         all_tokens;
     if (!parseEinsumEquation(equation, all_tokens, nullptr, nullptr, nullptr)) {
@@ -1009,9 +1022,9 @@ LogicalResult ShapeAnalysis::applyMhloOpConstraint(Operation* op) {
       SmallVector<std::pair<Value, int64_t>> equalValues;
       for (auto item : token.second) {
         if (item.first == kIsLhs) {
-          equalValues.push_back(std::make_pair(einsum.lhs(), item.second));
+          equalValues.push_back(std::make_pair(einsum.getLhs(), item.second));
         } else if (item.first == kIsRhs) {
-          equalValues.push_back(std::make_pair(einsum.rhs(), item.second));
+          equalValues.push_back(std::make_pair(einsum.getRhs(), item.second));
         } else {
           // kIsResult
           equalValues.push_back(
@@ -1028,36 +1041,38 @@ LogicalResult ShapeAnalysis::applyMhloOpConstraint(Operation* op) {
       }
     }
   } else if (auto clamp = dyn_cast<mhlo::ClampOp>(op)) {
-    int64_t min_rank = clamp.min().getType().cast<RankedTensorType>().getRank();
-    int64_t max_rank = clamp.max().getType().cast<RankedTensorType>().getRank();
+    int64_t min_rank =
+        clamp.getMin().getType().cast<RankedTensorType>().getRank();
+    int64_t max_rank =
+        clamp.getMax().getType().cast<RankedTensorType>().getRank();
     if (min_rank != 0) {
-      mapShapeEqual(clamp.operand(), clamp.min());
+      mapShapeEqual(clamp.getOperand(), clamp.getMin());
     }
     if (max_rank != 0) {
-      mapShapeEqual(clamp.operand(), clamp.max());
+      mapShapeEqual(clamp.getOperand(), clamp.getMax());
     }
-    mapShapeEqual(clamp.operand(), op->getResult(0));
+    mapShapeEqual(clamp.getOperand(), op->getResult(0));
   } else if (auto select = dyn_cast<mhlo::SelectOp>(op)) {
     int64_t pred_rank =
-        select.pred().getType().cast<RankedTensorType>().getRank();
+        select.getPred().getType().cast<RankedTensorType>().getRank();
     int64_t true_rank =
-        select.on_true().getType().cast<RankedTensorType>().getRank();
+        select.getOnTrue().getType().cast<RankedTensorType>().getRank();
     int64_t false_rank =
-        select.on_false().getType().cast<RankedTensorType>().getRank();
+        select.getOnFalse().getType().cast<RankedTensorType>().getRank();
     if (pred_rank != 0) {
-      mapShapeEqual(select.pred(), select.getResult());
+      mapShapeEqual(select.getPred(), select.getResult());
     }
     if (true_rank != 0) {
-      mapShapeEqual(select.on_true(), select.getResult());
+      mapShapeEqual(select.getOnTrue(), select.getResult());
     }
     if (false_rank != 0) {
-      mapShapeEqual(select.on_false(), select.getResult());
+      mapShapeEqual(select.getOnFalse(), select.getResult());
     }
   } else if (isa<mhlo::GatherOp, mhlo::DynamicGatherOp>(op)) {
     auto gather = dyn_cast<mhlo::GatherOp>(op);
     auto d_gather = dyn_cast<mhlo::DynamicGatherOp>(op);
     auto dimension_numbers =
-        gather ? gather.dimension_numbers() : d_gather.dimension_numbers();
+        gather ? gather.getDimensionNumbers() : d_gather.getDimensionNumbers();
     Value in = op->getOperand(0);
     Value result = op->getResult(0);
     auto in_ty = in.getType().dyn_cast<RankedTensorType>();
@@ -1077,7 +1092,7 @@ LogicalResult ShapeAnalysis::applyMhloOpConstraint(Operation* op) {
       }
       remapped_offset_dims.push_back(i);
     }
-    for (auto offset : llvm::enumerate(offset_dims)) {
+    for (const auto& offset : llvm::enumerate(offset_dims)) {
       mapDimEqual(in, remapped_offset_dims[offset.index()], result,
                   offset.value());
     }
@@ -1086,7 +1101,7 @@ LogicalResult ShapeAnalysis::applyMhloOpConstraint(Operation* op) {
   return success();
 }
 
-LogicalResult ShapeAnalysis::applyLmhloOpConstraint(Operation* op) {
+LogicalResult ShapeAnalysisDeprecated::applyLmhloOpConstraint(Operation* op) {
   auto mapValueEquivalent = [&](Value lhs, Value rhs,
                                 EquivalenceClasses<ValueWrapper>& impl) {
     if (!impl.isEquivalent(ValueWrapper(lhs), ValueWrapper(rhs))) {
@@ -1107,14 +1122,14 @@ LogicalResult ShapeAnalysis::applyLmhloOpConstraint(Operation* op) {
   if (auto transpose = dyn_cast<lmhlo::TransposeOp>(op)) {
     Value operand = op->getOperand(0);
     Value result = op->getOperand(1);
-    for (auto& en :
-         llvm::enumerate(transpose.permutation().getValues<int64_t>())) {
+    for (const auto& en :
+         llvm::enumerate(transpose.getPermutation().getValues<int64_t>())) {
       mapDimEqual(operand, en.value(), result, en.index());
     }
     mapValueEquivalent(operand, result, valueWithSameElements_);
   } else if (auto concat = dyn_cast<lmhlo::ConcatenateOp>(op)) {
     Value result = cast<lmhlo::LmhloOp>(op).getResultBuffer();
-    int64_t axis = concat.dimension();
+    int64_t axis = concat.getDimension();
     int64_t rank = result.getType().cast<MemRefType>().getRank();
     for (Value operand : op->getOperands().drop_back()) {
       for (int64_t i = 0; i < rank; ++i) {
@@ -1128,7 +1143,7 @@ LogicalResult ShapeAnalysis::applyLmhloOpConstraint(Operation* op) {
     int64_t rank = operand.getType().cast<MemRefType>().getRank();
     int64_t resultDimIdx = 0;
     for (int64_t i = 0; i < rank; ++i) {
-      auto reduceDims = reduce.dimensions().getValues<int64_t>();
+      auto reduceDims = reduce.getDimensions().getValues<int64_t>();
       if (std::find(reduceDims.begin(), reduceDims.end(), i) !=
           reduceDims.end()) {
         continue;
@@ -1141,8 +1156,8 @@ LogicalResult ShapeAnalysis::applyLmhloOpConstraint(Operation* op) {
     Value result = op->getOperand(2);
     auto ty = operand.getType().dyn_cast<ShapedType>();
     assert(ty);
-    for (auto& dim : llvm::enumerate(
-             broadcast_in_dim.broadcast_dimensions().getValues<int64_t>())) {
+    for (const auto& dim : llvm::enumerate(
+             broadcast_in_dim.getBroadcastDimensions().getValues<int64_t>())) {
       // Deal with non-static & non-one dim.
       if (!ty.isDynamicDim(dim.index()) && ty.getDimSize(dim.index()) != 1) {
         mapDimEqual(operand, dim.index(), result, dim.value());
@@ -1154,7 +1169,7 @@ LogicalResult ShapeAnalysis::applyLmhloOpConstraint(Operation* op) {
     // DotGeneralOp for lmhlo Dialect.
     Value lhs = op->getOperand(0);
     Value rhs = op->getOperand(1);
-    auto dim_numbers = dot_general.dot_dimension_numbers();
+    auto dim_numbers = dot_general.getDotDimensionNumbers();
     DenseSet<int64_t> lhs_contract_batch_dims;
     DenseSet<int64_t> rhs_contract_batch_dims;
     // Contracting dimensions.
@@ -1204,30 +1219,31 @@ LogicalResult ShapeAnalysis::applyLmhloOpConstraint(Operation* op) {
                   i + lhs_batching_dims.size());
     }
   } else if (auto clamp = dyn_cast<lmhlo::ClampOp>(op)) {
-    int64_t min_rank = clamp.min().getType().cast<MemRefType>().getRank();
-    int64_t max_rank = clamp.max().getType().cast<MemRefType>().getRank();
+    int64_t min_rank = clamp.getMin().getType().cast<MemRefType>().getRank();
+    int64_t max_rank = clamp.getMax().getType().cast<MemRefType>().getRank();
     if (min_rank != 0) {
-      mapShapeEqual(clamp.operand(), clamp.min());
+      mapShapeEqual(clamp.getOperand(), clamp.getMin());
     }
     if (max_rank != 0) {
-      mapShapeEqual(clamp.operand(), clamp.max());
+      mapShapeEqual(clamp.getOperand(), clamp.getMax());
     }
     Value result = cast<lmhlo::LmhloOp>(op).getResultBuffer();
-    mapShapeEqual(clamp.operand(), result);
+    mapShapeEqual(clamp.getOperand(), result);
   } else if (auto select = dyn_cast<lmhlo::SelectOp>(op)) {
-    int64_t pred_rank = select.pred().getType().cast<MemRefType>().getRank();
-    int64_t true_rank = select.on_true().getType().cast<MemRefType>().getRank();
+    int64_t pred_rank = select.getPred().getType().cast<MemRefType>().getRank();
+    int64_t true_rank =
+        select.getOnTrue().getType().cast<MemRefType>().getRank();
     int64_t false_rank =
-        select.on_false().getType().cast<MemRefType>().getRank();
+        select.getOnFalse().getType().cast<MemRefType>().getRank();
     Value result = cast<lmhlo::LmhloOp>(op).getResultBuffer();
     if (pred_rank != 0) {
-      mapShapeEqual(select.pred(), result);
+      mapShapeEqual(select.getPred(), result);
     }
     if (true_rank != 0) {
-      mapShapeEqual(select.on_true(), result);
+      mapShapeEqual(select.getOnTrue(), result);
     }
     if (false_rank != 0) {
-      mapShapeEqual(select.on_false(), result);
+      mapShapeEqual(select.getOnFalse(), result);
     }
   } else if (isa<lmhlo::DynamicReshapeOp, lmhlo::ReshapeOp>(op)) {
     Value input = op->getOperand(0);
@@ -1240,7 +1256,7 @@ LogicalResult ShapeAnalysis::applyLmhloOpConstraint(Operation* op) {
   return success();
 }
 
-LogicalResult ShapeAnalysis::applyDimEqualWithDimValue() {
+LogicalResult ShapeAnalysisDeprecated::applyDimEqualWithDimValue() {
   std::unordered_map<DimValue, SmallVector<SymbolDim*, 4>, DimValueHash>
       dimValue2DimSymbols;
   for (auto symbol_value : dimSymbol2DimValue_) {
@@ -1262,7 +1278,7 @@ LogicalResult ShapeAnalysis::applyDimEqualWithDimValue() {
   return success();
 }
 
-LogicalResult ShapeAnalysis::buildRegionMulDecompose(Region* region) {
+LogicalResult ShapeAnalysisDeprecated::buildRegionMulDecompose(Region* region) {
   if (region->getBlocks().size() != 1) {
     return region->getParentOp()->emitError(
         "only single block region is supported");
@@ -1273,7 +1289,7 @@ LogicalResult ShapeAnalysis::buildRegionMulDecompose(Region* region) {
   return success();
 }
 
-LogicalResult ShapeAnalysis::buildBlockMulDecompose(Block* block) {
+LogicalResult ShapeAnalysisDeprecated::buildBlockMulDecompose(Block* block) {
   // mapping each op inside the block
   WalkResult result = block->walk([&](Operation* op) {
     if (auto muli = dyn_cast_or_null<arith::MulIOp>(op)) {
@@ -1358,7 +1374,8 @@ LogicalResult ShapeAnalysis::buildBlockMulDecompose(Block* block) {
   }
 }
 
-LogicalResult ShapeAnalysis::visitSymbolShapes(SymbolShapeVisitor visitor) {
+LogicalResult ShapeAnalysisDeprecated::visitSymbolShapes(
+    SymbolShapeVisitor visitor) {
   for (auto it = shapeMap_.begin(), stop = shapeMap_.end(); it != stop; ++it) {
     Value value = it->first;
     SymbolShape& symbolShape = it->second;
@@ -1366,7 +1383,7 @@ LogicalResult ShapeAnalysis::visitSymbolShapes(SymbolShapeVisitor visitor) {
     Location loc = op_->getLoc();
     Operation* definingOp = value.getDefiningOp();
     if (!definingOp) {
-      Block* block = cast<BlockArgument>(value).getOwner();
+      Block* block = value.dyn_cast<BlockArgument>().getOwner();
       loc = block->getParentOp()->getLoc();
       b.setInsertionPoint(block, block->begin());
     } else {
@@ -1378,7 +1395,7 @@ LogicalResult ShapeAnalysis::visitSymbolShapes(SymbolShapeVisitor visitor) {
   return success();
 }
 
-LogicalResult ShapeAnalysis::buildSymbolDimInstances(
+LogicalResult ShapeAnalysisDeprecated::buildSymbolDimInstances(
     DenseMap<SymbolDim*, SmallVector<Value>>& symbolDim2Instances,
     DenseMap<Value, SmallVector<Value>>& shapedValue2Dims) {
   // Instantiate each symbol dim and group all instances for each symbol dim.
@@ -1398,7 +1415,7 @@ LogicalResult ShapeAnalysis::buildSymbolDimInstances(
   return visitSymbolShapes(visitor);
 }
 
-LogicalResult ShapeAnalysis::buildSymbolDimInstancesDominantMap(
+LogicalResult ShapeAnalysisDeprecated::buildSymbolDimInstancesDominantMap(
     DenseMap<SymbolDim*, SmallVector<Value>>& instanceMap,
     DenseMap<SymbolDim*, DenseMap<Value, Value>>& dominantMap) {
   DominanceInfo dominanceInfo(op_);
@@ -1437,7 +1454,7 @@ LogicalResult ShapeAnalysis::buildSymbolDimInstancesDominantMap(
   return success();
 }
 
-void ShapeAnalysis::dumpSymbol2InstancesDominant(
+void ShapeAnalysisDeprecated::dumpSymbol2InstancesDominant(
     Symbol2InstancesDominantType symbol2InstancesDominant) {
   llvm::dbgs() << "symbol2InstancesDominant: "
                << symbol2InstancesDominant.size() << "\n";
@@ -1511,7 +1528,7 @@ void ShapeAnalysis::dumpSymbol2InstancesDominant(
 // value if they are the same (e.g. the operands for allocOp or reinterpret_cast
 // itself if it's external buffer) and following passes can simply reply on
 // normal CSE & canonicalization pass to simplify index computation.
-LogicalResult ShapeAnalysis::buildTieShapeOps() {
+LogicalResult ShapeAnalysisDeprecated::buildTieShapeOps() {
   // create a dim op for each dimension of a shaped Value and group all such dim
   // ops by SymbolDim. Examples:
   //   %1 = mhlo.abs(%0) : (tensor<?xf32>) -> tensor<?xf32>
@@ -1576,7 +1593,7 @@ LogicalResult ShapeAnalysis::buildTieShapeOps() {
   return visitSymbolShapes(visitor);
 }
 
-bool ShapeAnalysis::HasSameNumElements(Value lhs, Value rhs) {
+bool ShapeAnalysisDeprecated::isSameNumElements(Value lhs, Value rhs) {
   if (valueWithSameElements_.isEquivalent(ValueWrapper(lhs),
                                           ValueWrapper(rhs))) {
     return true;
@@ -1598,7 +1615,7 @@ bool ShapeAnalysis::HasSameNumElements(Value lhs, Value rhs) {
   return (lhs_mapped == lhs_rank) && (rhs_mapped == rhs_rank);
 }
 
-bool ShapeAnalysis::extractContinuousDimEqualInfo(
+bool ShapeAnalysisDeprecated::extractContinuousDimEqualInfo(
     Value lhs, Value rhs,
     SmallVector<std::pair<SmallVector<int64_t>, SmallVector<int64_t>>>& equal) {
   equal.clear();
@@ -1777,7 +1794,7 @@ bool ShapeAnalysis::extractContinuousDimEqualInfo(
   return true;
 }
 
-void ShapeAnalysis::buildEqualShapesInFusion(
+void ShapeAnalysisDeprecated::buildEqualShapesInFusion(
     const Operation* fusion, const DenseSet<Value>& values_in_fusion) {
   auto& equal_in_fusion = valueWithEqualShapeInFusion_[fusion];
   DenseMap<SymbolShape*, SmallVector<Value>> value_classes;
@@ -1796,7 +1813,8 @@ void ShapeAnalysis::buildEqualShapesInFusion(
   }
 }
 
-Value ShapeAnalysis::GetLeaderValueWithSameShapeGlobal(Value val) const {
+Value ShapeAnalysisDeprecated::GetLeaderValueWithSameShapeGlobal(
+    Value val) const {
   if (valueWithEqualShape_.findLeader(ValueWrapper(val)) ==
       valueWithEqualShape_.member_end()) {
     return nullptr;
@@ -1804,7 +1822,7 @@ Value ShapeAnalysis::GetLeaderValueWithSameShapeGlobal(Value val) const {
   return valueWithEqualShape_.getLeaderValue(ValueWrapper(val)).getValue();
 }
 
-Value ShapeAnalysis::GetLeaderValueWithSameShapeInFusion(
+Value ShapeAnalysisDeprecated::GetLeaderValueWithSameShapeInFusion(
     const Operation* fusion, Value val) const {
   if (fusion == nullptr) {
     return nullptr;
@@ -1822,7 +1840,7 @@ Value ShapeAnalysis::GetLeaderValueWithSameShapeInFusion(
 
 // update with view map
 
-bool ShapeAnalysis::getConstIntValue(Operation* op, int64_t& result) {
+bool ShapeAnalysisDeprecated::getConstIntValue(Operation* op, int64_t& result) {
   if (auto constOp = dyn_cast_or_null<arith::ConstantIndexOp>(op)) {
     result = constOp.value();
     return true;
@@ -1890,6 +1908,118 @@ void OpListShapeAnalysis::PropagateEquality(
       }
     }
   } while (!converged);
+}
+
+bool ShapeAnalysis::isSameNumElements(Value lhs, Value rhs) {
+  if (lhs == rhs) return true;
+
+  auto lhsTy = lhs.getType().dyn_cast<ShapedType>();
+  auto rhsTy = rhs.getType().dyn_cast<ShapedType>();
+
+  if (!lhsTy || !rhsTy || !lhsTy.hasRank() || !rhsTy.hasRank()) return false;
+
+  return isProductEqual(lhs, 0, lhsTy.getRank(), rhs, 0, rhsTy.getRank());
+}
+
+bool ShapeAnalysis::isProductEqual(Value lhs, int lhsFrom, int lhsTo, Value rhs,
+                                   int rhsFrom, int rhsTo) {
+  SmallVector<int> lhsDimIdxs, rhsDimIdxs;
+  lhsDimIdxs.reserve(lhsTo - lhsFrom);
+  rhsDimIdxs.reserve(rhsTo - rhsFrom);
+  for (int i = lhsFrom; i < lhsTo; ++i) lhsDimIdxs.push_back(i);
+  for (int i = rhsFrom; i < rhsTo; ++i) rhsDimIdxs.push_back(i);
+
+  return isProductEqual(lhs, lhsDimIdxs, rhs, rhsDimIdxs);
+}
+
+ShapeConstraintIRAnalysis::ShapeConstraintIRAnalysis(Operation* op)
+    : op_(op), mgr_(op->getParentOfType<ModuleOp>()) {
+  mgr_.load();
+  ModuleOp m = op_->getParentOfType<ModuleOp>();
+  op_->walk([&](Operation* op) {
+    if (!isa<memref::AllocOp, memref::ReinterpretCastOp>(op)) return;
+    Value result = op->getResult(0);
+    auto resultTy = result.getType().dyn_cast<MemRefType>();
+    // Only support ranked memref types.
+    if (!resultTy) return;
+    // Ealry return if the memref is static or does not have symbolic dim attr
+    auto attrs = op->getAttrOfType<ArrayAttr>(
+        disc_shape::SymbolicDimOp::getSymbolicDimAttrName());
+    if (!attrs) return;
+    auto& symbols = memrefValue2SymDims_[result];
+    for (const auto& attr : attrs) {
+      auto symOp = mgr_.symbolTable().lookup<disc_shape::SymbolicDimOp>(
+          attr.cast<FlatSymbolRefAttr>().getValue());
+      assert(symOp && "symbolic op is not found");
+      symbols.push_back(symOp);
+    }
+  });
+}
+
+ShapeConstraintIRAnalysis::~ShapeConstraintIRAnalysis() { mgr_.save(); }
+
+bool ShapeConstraintIRAnalysis::isShapeEqual(Value lhs, Value rhs) {
+  if (lhs == rhs) return true;
+
+  auto lhsTy = lhs.getType().dyn_cast<ShapedType>();
+  auto rhsTy = rhs.getType().dyn_cast<ShapedType>();
+
+  if (!lhsTy || !rhsTy || !lhsTy.hasRank() || !rhsTy.hasRank()) return false;
+
+  if (lhsTy.hasStaticShape() && rhsTy.hasStaticShape()) {
+    return lhsTy.getShape() == rhsTy.getShape();
+  }
+
+  auto lhsIt = memrefValue2SymDims_.find(lhs);
+  auto rhsIt = memrefValue2SymDims_.find(rhs);
+
+  if (lhsIt == memrefValue2SymDims_.end() ||
+      rhsIt == memrefValue2SymDims_.end() ||
+      lhsIt->second.size() != rhsIt->second.size())
+    return false;
+
+  SmallVector<disc_shape::SymbolicDimOp> lhsSyms;
+  SmallVector<disc_shape::SymbolicDimOp> rhsSyms;
+  for (auto sym : lhsIt->second) {
+    lhsSyms.push_back(mgr_.getRootSymbolicDim(sym));
+  }
+  for (auto sym : rhsIt->second) {
+    rhsSyms.push_back(mgr_.getRootSymbolicDim(sym));
+  }
+  return lhsSyms == rhsSyms;
+}
+
+bool ShapeConstraintIRAnalysis::isProductEqual(Value lhs,
+                                               ArrayRef<int> lhsDimIdxs,
+                                               Value rhs,
+                                               ArrayRef<int> rhsDimIdxs) {
+  SymbolicDimProduct lhsProd;
+  SymbolicDimProduct rhsProd;
+
+  auto buildSymbolicDimProduct = [&](SymbolicDimProduct& prod, Value value,
+                                     ArrayRef<int> dimIdxs) {
+    auto ty = value.getType().dyn_cast<ShapedType>();
+    auto it = memrefValue2SymDims_.find(value);
+    if (!ty || !ty.hasRank()) return false;
+
+    for (int idx : dimIdxs) {
+      if (ty.getShape()[idx] == ShapedType::kDynamic) {
+        if (it == memrefValue2SymDims_.end() || it->second.size() <= idx)
+          return false;
+        prod.symbols.push_back(it->second[idx]);
+      } else {
+        prod.factor *= ty.getShape()[idx];
+      }
+    }
+    return true;
+  };
+
+  if (!buildSymbolicDimProduct(lhsProd, lhs, lhsDimIdxs) ||
+      !buildSymbolicDimProduct(rhsProd, rhs, rhsDimIdxs)) {
+    return false;
+  }
+
+  return mgr_.isSymbolicDimProductEqual(lhsProd, rhsProd);
 }
 
 }  // namespace disc_ral

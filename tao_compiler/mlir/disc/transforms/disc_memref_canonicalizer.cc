@@ -16,6 +16,7 @@ limitations under the License.
 // This file implements the logic to flattern memref to 1D format.
 
 #include "llvm/Support/Debug.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/Location.h"
 #include "mlir/IR/MLIRContext.h"
@@ -23,7 +24,7 @@ limitations under the License.
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/Passes.h"
-#include "tensorflow/compiler/mlir/disc/transforms/PassDetail.h"
+#include "mlir/disc/transforms/PassDetail.h"
 
 namespace mlir {
 namespace disc_ral {
@@ -43,7 +44,8 @@ struct ReinterpretCastOpConverter : public OpRewritePattern<ReinterpretCastOp> {
 LogicalResult ReinterpretCastOpConverter::matchAndRewrite(
     ReinterpretCastOp op, PatternRewriter& rewriter) const {
   Location loc = op.getLoc();
-  auto alloc = dyn_cast_or_null<memref::AllocOp>(op.source().getDefiningOp());
+  auto alloc =
+      dyn_cast_or_null<memref::AllocOp>(op.getSource().getDefiningOp());
   if (!alloc) return failure();
 
   auto allocTy = alloc.getResult().getType().cast<MemRefType>();
@@ -52,6 +54,10 @@ LogicalResult ReinterpretCastOpConverter::matchAndRewrite(
   if (!allocTy.hasStaticShape()) {
     alloc->setOperands(op.sizes());
   }
+  StringRef attrName = disc_shape::SymbolicDimOp::getSymbolicDimAttrName();
+  if (op->hasAttr(attrName)) {
+    alloc->setAttr(attrName, op->getAttr(attrName));
+  }
   rewriter.replaceOp(op, alloc->getResults());
   return success();
 }
@@ -59,7 +65,7 @@ LogicalResult ReinterpretCastOpConverter::matchAndRewrite(
 struct DiscMemrefCanonicalizer
     : DiscMemrefCanonicalizerBase<DiscMemrefCanonicalizer> {
   void runOnOperation() override {
-    FuncOp func = getOperation();
+    func::FuncOp func = getOperation();
     MLIRContext* ctx = func.getContext();
 
     // Populate patterns.
@@ -71,7 +77,8 @@ struct DiscMemrefCanonicalizer
 
 }  // namespace
 
-std::unique_ptr<OperationPass<FuncOp>> createDiscMemrefCanonicalizerPass() {
+std::unique_ptr<OperationPass<func::FuncOp>>
+createDiscMemrefCanonicalizerPass() {
   return std::make_unique<DiscMemrefCanonicalizer>();
 }
 

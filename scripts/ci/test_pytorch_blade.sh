@@ -25,12 +25,27 @@ export LIBRARY_PATH=${CUDA_HOME}/lib64:$LIBRARY_PATH
 export TF_REMOTE_CACHE=${TF_REMOTE_CACHE}
 export TORCH_BLADE_BUILD_TENSORRT_STATIC=${TORCH_BLADE_BUILD_TENSORRT_STATIC:-OFF}
 
+function delete_disk_caches() {
+  # https://bazel.build/remote/caching#delete-remote-cache
+  ndays=10
+  if [ -d "cas" ] && [ -d "ac" ]; then
+    echo "Before old disk caches deleting"
+    du cas/ ac/ --max-depth=0 -h
+    find cas -type f -mtime +${ndays} -delete
+    find ac -type f -mtime +${ndays} -delete
+    echo "After old disk caches deleting"
+    du cas/ ac/ --max-depth=0 -h
+  fi
+}
+
+(cd ~/.cache/ && delete_disk_caches)
+
 if [[ -f ~/.cache/proxy_config ]]; then
   source ~/.cache/proxy_config
 fi
 
 # cleanup build cache
-(cd tf_community && bazel clean --expunge)
+(cd tao_compiler && bazel clean --expunge)
 
 # note(yancey.yx): using virtualenv to avoid permission issue on workflow actions CI,
 if [ $TORCH_BLADE_CI_BUILD_TORCH_VERSION = "ngc" ]; then
@@ -39,15 +54,28 @@ else
   python -m virtualenv venv && source venv/bin/activate
 fi
 
+python -m pip install -U pip
+python -m pip install onnx==1.11.0 # workaround for latest onnx installing failure
+
+arch=`uname -p`
+if [[ $arch == "aarch64" ]]; then
+  # higher prootbuf version has compatible problem.
+  # TODO(disc): upgrade protobuf once we fix the problem.
+  python -m pip install protobuf==3.20.1
+fi
+
 export TORCH_BLADE_CI_BUILD_TORCH_VERSION=${TORCH_BLADE_CI_BUILD_TORCH_VERSION:-1.7.1+cu110}
 (cd pytorch_blade && bazel clean --expunge \
-  && python -m pip install -q -r requirements-dev-${TORCH_BLADE_CI_BUILD_TORCH_VERSION}.txt \
-       -f https://download.pytorch.org/whl/torch_stable.html \
-  && TORCH_LIB=$(python -c 'import torch; import os; print(os.path.dirname(os.path.abspath(torch.__file__)) + "/lib/")') \
-  && export LD_LIBRARY_PATH=$TORCH_LIB:$LD_LIBRARY_PATH \
-  && bash ./ci_build/build_pytorch_blade.sh)
+  && bash ./scripts/build_pytorch_blade.sh)
 
 mkdir -p build && \
 mv pytorch_blade/dist/torch_blade*.whl ./build
+
+case $TORCH_BLADE_CI_BUILD_TORCH_VERSION in
+  *1.11.* | *1.12.* | *1.13.*)
+    (cd tools/torch_quant && bash ./test.sh)
+    mv tools/torch_quant/dist/torch_quant*.whl ./build
+    ;;
+esac
 
 deactivate

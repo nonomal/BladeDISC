@@ -23,29 +23,37 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Support/FormatVariadic.h"
-#include "mlir/Conversion/ArithmeticToLLVM/ArithmeticToLLVM.h"
+#include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
 #include "mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h"
+#include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVM.h"
 #include "mlir/Conversion/GPUToNVVM/GPUToNVVMPass.h"
 #include "mlir/Conversion/LLVMCommon/ConversionTarget.h"
 #include "mlir/Conversion/LLVMCommon/LoweringOptions.h"
 #include "mlir/Conversion/LLVMCommon/TypeConverter.h"
 #include "mlir/Conversion/MathToLLVM/MathToLLVM.h"
 #include "mlir/Conversion/MemRefToLLVM/MemRefToLLVM.h"
-#include "mlir/Dialect/GPU/GPUDialect.h"
-#include "mlir/Dialect/GPU/Passes.h"
+#include "mlir/Conversion/NVGPUToNVVM/NVGPUToNVVM.h"
+#include "mlir/Conversion/VectorToLLVM/ConvertVectorToLLVM.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
+#include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/GPU/Transforms/Passes.h"
 #include "mlir/Dialect/LLVMIR/NVVMDialect.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
-#include "mlir/IR/BlockAndValueMapping.h"
+#include "mlir/Dialect/MemRef/Transforms/Passes.h"
+#include "mlir/Dialect/MemRef/Transforms/Transforms.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "mlir/disc/transforms/PassDetail.h"
+#include "mlir/disc/transforms/disc_lower_gpu_ops_common.h"
+#include "mlir/disc/transforms/placement_utils.h"
 #include "mlir/lib/Conversion/GPUCommon/GPUOpsLowering.h"
 #include "mlir/lib/Conversion/GPUCommon/IndexIntrinsicsOpLowering.h"
 #include "mlir/lib/Conversion/GPUCommon/OpToFuncCallLowering.h"
-#include "mlir/lib/Conversion/PassDetail.h"
-#include "tensorflow/compiler/mlir/disc/transforms/PassDetail.h"
-#include "tensorflow/compiler/mlir/disc/transforms/disc_lower_gpu_ops_common.h"
 
 namespace mlir {
 namespace disc_ral {
@@ -55,6 +63,47 @@ namespace {
 /// Import the GPU Ops to NVVM Patterns.
 #include "GPUToNVVM.cpp.inc"
 
+/// Conversion vector.store with align attribute to llvm.store
+class VectorStoreWithAlignToLLVMPattern
+    : public ConvertOpToLLVMPattern<vector::StoreOp> {
+  using ConvertOpToLLVMPattern<vector::StoreOp>::ConvertOpToLLVMPattern;
+
+  LogicalResult matchAndRewrite(
+      vector::StoreOp storeOp, OpAdaptor adaptor,
+      ConversionPatternRewriter& rewriter) const override {
+    // Only 1-D vectors can be lowered to LLVM.
+    VectorType vectorTy = storeOp.getVectorType();
+    if (vectorTy.getRank() > 1) return failure();
+    auto alignAttr = storeOp->getAttrOfType<IntegerAttr>("alignment");
+    if (!alignAttr) return failure();
+    unsigned align = alignAttr.getInt();
+
+    auto loc = storeOp->getLoc();
+    MemRefType memRefTy = storeOp.getMemRefType();
+
+    // Resolve address.
+    auto vtype = cast<VectorType>(
+        this->typeConverter->convertType(storeOp.getVectorType()));
+    Value dataPtr = this->getStridedElementPtr(loc, memRefTy, adaptor.getBase(),
+                                               adaptor.getIndices(), rewriter);
+    // Casts a strided element pointer to a vector pointer.  The vector pointer
+    // will be in the same address space as the incoming memref type.
+    Value ptr;
+    if ((*this->getTypeConverter()).useOpaquePointers()) {
+      ptr = dataPtr;
+    } else {
+      unsigned addressSpace =
+          *(*this->getTypeConverter()).getMemRefAddressSpace(memRefTy);
+      auto pType = LLVM::LLVMPointerType::get(vtype, addressSpace);
+      ptr = rewriter.create<LLVM::BitcastOp>(loc, pType, dataPtr);
+    }
+
+    rewriter.replaceOpWithNewOp<LLVM::StoreOp>(
+        storeOp, adaptor.getValueToStore(), ptr, align);
+    return success();
+  }
+};
+
 /// A pass that replaces all occurrences of GPU device operations with their
 /// corresponding NVVM equivalent.
 ///
@@ -63,7 +112,7 @@ namespace {
 struct DiscLowerGpuOpsToNVVMOpsPass
     : public DiscLowerGpuOpsToNVVMOpsPassBase<DiscLowerGpuOpsToNVVMOpsPass> {
   DiscLowerGpuOpsToNVVMOpsPass() = default;
-  DiscLowerGpuOpsToNVVMOpsPass(unsigned indexBitwidth) {
+  DiscLowerGpuOpsToNVVMOpsPass(unsigned indexBitwidth, bool hasRedux = false) {
     this->indexBitwidth = indexBitwidth;
   }
 
@@ -74,114 +123,74 @@ struct DiscLowerGpuOpsToNVVMOpsPass
     LowerToLLVMOptions options(
         m.getContext(),
         DataLayout(cast<DataLayoutOpInterface>(m.getOperation())));
-    options.emitCWrappers = true;
     if (indexBitwidth != kDeriveIndexBitwidthFromDataLayout)
       options.overrideIndexBitwidth(indexBitwidth);
 
-    /// MemRef conversion for GPU to NVVM lowering. The GPU dialect uses memory
-    /// space 5 for private memory attributions, but NVVM represents private
-    /// memory allocations as local `alloca`s in the default address space. This
-    /// converter drops the private memory space to support the use case above.
+    // Apply in-dialect lowering. In-dialect lowering will replace
+    // ops which need to be lowered further, which is not supported by a
+    // single conversion pass.
+    {
+      RewritePatternSet patterns(m.getContext());
+      populateGpuRewritePatterns(patterns);
+      if (failed(applyPatternsAndFoldGreedily(m, std::move(patterns))))
+        return signalPassFailure();
+    }
+
     LLVMTypeConverter converter(m.getContext(), options);
-    converter.addConversion([&](MemRefType type) -> Optional<Type> {
-      if (!type.getMemorySpace().isa<IntegerAttr>() ||
-          type.getMemorySpaceAsInt() !=
-              gpu::GPUDialect::getPrivateAddressSpace())
-        return llvm::None;
-      return converter.convertType(MemRefType::Builder(type).setMemorySpace(0));
-    });
+    // NVVM uses alloca in the default address space to represent private
+    // memory allocations, so drop private annotations. NVVM uses address
+    // space 3 for shared memory. NVVM uses the default address space to
+    // represent global memory.
+    populateGpuMemorySpaceAttributeConversions(
+        converter, [](gpu::AddressSpace space) -> unsigned {
+          switch (space) {
+            case gpu::AddressSpace::Global:
+              return static_cast<unsigned>(
+                  NVVM::NVVMMemorySpace::kGlobalMemorySpace);
+            case gpu::AddressSpace::Workgroup:
+              return static_cast<unsigned>(
+                  NVVM::NVVMMemorySpace::kSharedMemorySpace);
+            case gpu::AddressSpace::Private:
+              return 0;
+          }
+          llvm_unreachable("unknown address space enum value");
+          return 0;
+        });
 
     // Lowering for MMAMatrixType.
     converter.addConversion([&](gpu::MMAMatrixType type) -> Type {
-      // The number of items in structToReturn are dependent on the the dataType
-      // and the MMA operand that this operation is associated with.
-      llvm::DenseMap<StringRef, int64_t> numElemsPerThreadF16,
-          numElemsPerThreadF32;
-      numElemsPerThreadF16["AOp"] = 8;
-      numElemsPerThreadF16["BOp"] = 8;
-      numElemsPerThreadF16["COp"] = 4;
-      numElemsPerThreadF32["AOp"] = 8;
-      numElemsPerThreadF32["BOp"] = 8;
-      numElemsPerThreadF32["COp"] = 8;
-      Type structToReturn;
-      if (type.getElementType().isF16()) {
-        // Number of f16's in 32-bit.
-        unsigned vecSize = 2;
-        Type vec = VectorType::get(vecSize, FloatType::getF16(&getContext()));
-        unsigned size = numElemsPerThreadF16[type.getOperand()];
-        SmallVector<Type> elements(size, vec);
-        structToReturn =
-            LLVM::LLVMStructType::getLiteral(&getContext(), elements);
-      } else if (type.getElementType().isF32()) {
-        unsigned size = numElemsPerThreadF32[type.getOperand()];
-        SmallVector<Type> elements(size, FloatType::getF32(&getContext()));
-        structToReturn =
-            LLVM::LLVMStructType::getLiteral(&getContext(), elements);
-      }
-      return structToReturn;
+      return convertMMAToLLVMType(type);
     });
-
-    RewritePatternSet patterns(m.getContext());
-
-    // Apply in-dialect lowering first. In-dialect lowering will replace ops
-    // which need to be lowered further, which is not supported by a single
-    // conversion pass.
-    populateGpuRewritePatterns(patterns);
-    (void)applyPatternsAndFoldGreedily(m, std::move(patterns));
-
     RewritePatternSet llvmPatterns(m.getContext());
-    populateMathToLLVMConversionPatterns(converter, llvmPatterns);
 
-    // These math ops will be lowered to nvvm intrinsics
-    SmallVector<std::string> disablePatterns = {
-        "mlir::VectorConvertToLLVMPattern<mlir::math::AbsOp, "
-        "mlir::LLVM::FAbsOp>",
-        "mlir::VectorConvertToLLVMPattern<mlir::math::CeilOp, "
-        "mlir::LLVM::FCeilOp>",
-        "mlir::VectorConvertToLLVMPattern<mlir::math::CosOp, "
-        "mlir::LLVM::CosOp>",
-        "mlir::VectorConvertToLLVMPattern<mlir::math::ExpOp, "
-        "mlir::LLVM::ExpOp>",
-        "mlir::VectorConvertToLLVMPattern<mlir::math::Exp2Op, "
-        "mlir::LLVM::Exp2Op>",
-        "{anonymous}::ExpM1OpLowering",
-        "mlir::VectorConvertToLLVMPattern<mlir::math::FloorOp, "
-        "mlir::LLVM::FFloorOp>",
-        "mlir::VectorConvertToLLVMPattern<mlir::math::Log10Op, "
-        "mlir::LLVM::Log10Op>",
-        "{anonymous}::Log1pOpLowering",
-        "mlir::VectorConvertToLLVMPattern<mlir::math::Log2Op, "
-        "mlir::LLVM::Log2Op>",
-        "mlir::VectorConvertToLLVMPattern<mlir::math::LogOp, "
-        "mlir::LLVM::LogOp>",
-        "mlir::VectorConvertToLLVMPattern<mlir::math::PowFOp, "
-        "mlir::LLVM::PowOp>",
-        "{anonymous}::RsqrtOpLowering",
-        "mlir::VectorConvertToLLVMPattern<mlir::math::SinOp, "
-        "mlir::LLVM::SinOp>",
-        "mlir::VectorConvertToLLVMPattern<mlir::math::SqrtOp, "
-        "mlir::LLVM::SqrtOp>"};
-
-    // Add the fix before official patterns.
+    // Add the fix before other conversions.
     llvmPatterns.add<GenericAtomicRMWOpLoweringWithBitcast>(
         converter, /* PatternBenefit */ 3);
     llvmPatterns.add<RemoveUselessUnrealizedConversionCastOp>(converter);
-    mlir::arith::populateArithmeticToLLVMConversionPatterns(converter,
-                                                            llvmPatterns);
-    populateStdToLLVMConversionPatterns(converter, llvmPatterns);
-    populateMemRefToLLVMConversionPatterns(converter, llvmPatterns);
+    llvmPatterns.add<VectorStoreWithAlignToLLVMPattern>(converter,
+                                                        /* PatternBenefit */ 3);
+    arith::populateArithToLLVMConversionPatterns(converter, llvmPatterns);
     cf::populateControlFlowToLLVMConversionPatterns(converter, llvmPatterns);
+    populateVectorToLLVMConversionPatterns(converter, llvmPatterns);
+    populateFuncToLLVMConversionPatterns(converter, llvmPatterns);
+    populateFinalizeMemRefToLLVMConversionPatterns(converter, llvmPatterns);
     populateGpuToNVVMConversionPatterns(converter, llvmPatterns);
+    populateNVGPUToNVVMConversionPatterns(converter, llvmPatterns);
+    // Put the math conversioin after GpuToNVVM conversions as some math ops
+    // are intended to be converted to nvvm intrinsics.
+    populateMathToLLVMConversionPatterns(converter, llvmPatterns);
+    memref::populateExpandStridedMetadataPatterns(llvmPatterns);
     populateGpuWMMAToNVVMConversionPatterns(converter, llvmPatterns);
-    auto llvmFrozenPatterns =
-        FrozenRewritePatternSet(std::move(llvmPatterns), disablePatterns, {});
+    if (this->hasRedux)
+      populateGpuSubgroupReduceOpLoweringPattern(converter, llvmPatterns);
+
     LLVMConversionTarget target(getContext());
     configureGpuToNVVMConversionLegality(target);
     target.addLegalDialect<LLVM::LLVMDialect>();
-    target.addIllegalDialect<StandardOpsDialect, arith::ArithmeticDialect,
-                             math::MathDialect, cf::ControlFlowDialect>();
+    target.addIllegalDialect<arith::ArithDialect, math::MathDialect,
+                             cf::ControlFlowDialect>();
     target.addIllegalOp<UnrealizedConversionCastOp>();
-    if (failed(applyPartialConversion(m, target, llvmFrozenPatterns)))
+    if (failed(applyPartialConversion(m, target, std::move(llvmPatterns))))
       signalPassFailure();
   }
 };
@@ -189,8 +198,10 @@ struct DiscLowerGpuOpsToNVVMOpsPass
 }  // anonymous namespace
 
 std::unique_ptr<OperationPass<gpu::GPUModuleOp>>
-createDiscLowerGpuOpsToNVVMOpsPass(unsigned indexBitwidth) {
-  return std::make_unique<DiscLowerGpuOpsToNVVMOpsPass>(indexBitwidth);
+createDiscLowerGpuOpsToNVVMOpsPass(unsigned indexBitwidth,
+                                   bool hasRedux = false) {
+  return std::make_unique<DiscLowerGpuOpsToNVVMOpsPass>(indexBitwidth,
+                                                        hasRedux);
 }
 
 }  // namespace disc_ral

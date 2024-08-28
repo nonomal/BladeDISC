@@ -16,24 +16,26 @@ limitations under the License.
 // This file implements the logic to outline each cpu kernel (represented as a
 // parallelOp) to a dedicated function.
 
+#include "lhlo/IR/lhlo_ops.h"
 #include "llvm/Support/Debug.h"
-#include "mlir-hlo/Dialect/lhlo/IR/lhlo_ops.h"
 #include "mlir/Dialect/Affine/LoopUtils.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
-#include "mlir/Dialect/SCF/SCF.h"
-#include "mlir/IR/BlockAndValueMapping.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Location.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/Pass/Pass.h"
+#include "mlir/Transforms/LoopInvariantCodeMotionUtils.h"
 #include "mlir/Transforms/Passes.h"
 #include "mlir/Transforms/RegionUtils.h"
-#include "tensorflow/compiler/mlir/disc/IR/disc_ral_ops.h"
-#include "tensorflow/compiler/mlir/disc/transforms/PassDetail.h"
-#include "tensorflow/compiler/mlir/disc/transforms/codegen_utils.h"
-#include "tensorflow/compiler/mlir/disc/transforms/fusion_utils.h"
-#include "tensorflow/compiler/mlir/disc/transforms/placement_utils.h"
+#include "mlir/disc/IR/disc_ral_ops.h"
+#include "mlir/disc/transforms/PassDetail.h"
+#include "mlir/disc/transforms/codegen_utils.h"
+#include "mlir/disc/transforms/fusion_utils.h"
+#include "mlir/disc/transforms/placement_utils.h"
 
 namespace mlir {
 namespace disc_ral {
@@ -100,7 +102,7 @@ LogicalResult sinkOperationsIntoLaunchOp(Region& launchOpBody) {
   }
 
   // Insert operations so that the defs get cloned before uses.
-  BlockAndValueMapping map;
+  IRMapping map;
   OpBuilder builder(launchOpBody);
   for (Operation* op : toBeSunk) {
     Operation* clonedOp = builder.clone(*op, map);
@@ -114,8 +116,9 @@ LogicalResult sinkOperationsIntoLaunchOp(Region& launchOpBody) {
 
 /// Outline the `launch` operation body into a kernel function. Replace
 /// `scf.yield` operations by `return` in the generated function.
-static FuncOp outlineKernelFuncImpl(Operation* launchOp, StringRef kernelFnName,
-                                    SetVector<Value>& operands) {
+static func::FuncOp outlineKernelFuncImpl(Operation* launchOp,
+                                          StringRef kernelFnName,
+                                          SetVector<Value>& operands) {
   Location loc = launchOp->getLoc();
   // Create a builder with no insertion point, insertion will happen separately
   // due to symbol table manipulation.
@@ -134,15 +137,15 @@ static FuncOp outlineKernelFuncImpl(Operation* launchOp, StringRef kernelFnName,
   }
   FunctionType type =
       FunctionType::get(launchOp->getContext(), kernelOperandTypes, {});
-  auto outlinedFunc = builder.create<FuncOp>(loc, kernelFnName, type);
+  auto outlinedFunc = builder.create<func::FuncOp>(loc, kernelFnName, type);
   outlinedFunc->setAttr(kCpuKernelFunc, builder.getUnitAttr());
 
-  BlockAndValueMapping map;
+  IRMapping map;
 
   // Map arguments from launch region to the arguments of the func
   // operation.
   Block& entryBlock = *outlinedFunc.addEntryBlock();
-  Region& outlinedFuncBody = outlinedFunc.body();
+  Region& outlinedFuncBody = outlinedFunc.getBody();
   for (auto operand : enumerate(operands))
     map.map(operand.value(), entryBlock.getArgument(operand.index()));
 
@@ -172,14 +175,14 @@ static FuncOp outlineKernelFuncImpl(Operation* launchOp, StringRef kernelFnName,
   for (Operation* op : toBeRemoved) {
     OpBuilder replacer(op);
     assert(op->getNumResults() == 0);
-    replacer.create<ReturnOp>(op->getLoc());
+    replacer.create<func::ReturnOp>(op->getLoc());
     op->erase();
   }
   return outlinedFunc;
 }
 
-FuncOp outlineKernelFunc(Operation* launchOp, StringRef kernelFnName,
-                         llvm::SmallVectorImpl<Value>& operands) {
+func::FuncOp outlineKernelFunc(Operation* launchOp, StringRef kernelFnName,
+                               llvm::SmallVectorImpl<Value>& operands) {
   DenseSet<Value> inputOperandSet;
   inputOperandSet.insert(operands.begin(), operands.end());
   SetVector<Value> operandSet(operands.begin(), operands.end());
@@ -205,7 +208,7 @@ std::string getKernelName(int index, scf::ParallelOp op, StringRef funcName) {
 /// Replace `parallel` operations with an `disc_ral.cpu_launch` operation
 /// launching `kernelFunc`. The kernel func contains the body of the
 /// `parallelOp` with constant region arguments inlined.
-static void convertToLaunchFuncOp(Operation* launchOp, FuncOp kernelFunc,
+static void convertToLaunchFuncOp(Operation* launchOp, func::FuncOp kernelFunc,
                                   ValueRange operands) {
   Location loc = launchOp->getLoc();
   OpBuilder builder(launchOp);
@@ -218,45 +221,78 @@ static void convertToLaunchFuncOp(Operation* launchOp, FuncOp kernelFunc,
   launchOp->erase();
 }
 
+/// Checks whether the given op can be hoisted by checking that
+/// - the op and none of its contained operations depend on values inside of the
+///   loop (by means of calling definedOutside).
+/// - the op is not terminator.
+bool canBeHoisted(Operation* op,
+                  llvm::function_ref<bool(Value)> definedOutside) {
+  // Do not move terminators.
+  if (op->hasTrait<OpTrait::IsTerminator>()) return false;
+
+  // Walk the nested operations and check that all used values are either
+  // defined outside of the loop or in a nested region, but not at the level of
+  // the loop body.
+  auto walkFn = [&](Operation* child) {
+    for (Value operand : child->getOperands()) {
+      // Ignore values defined in a nested region.
+      if (op->isAncestor(operand.getParentRegion()->getParentOp())) continue;
+      if (!definedOutside(operand)) return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  };
+  return !op->walk(walkFn).wasInterrupted();
+}
+
 LogicalResult cloneAndMoveTo(OpBuilder& b, scf::ParallelOp parallelOp,
                              ValueRange lower, ValueRange upper,
                              ValueRange step, Block* block) {
-  auto cloned = cast<scf::ParallelOp>(b.clone(*parallelOp.getOperation()));
+  scf::ParallelOp cloned =
+      cast<scf::ParallelOp>(b.clone(*parallelOp.getOperation()));
   cloned->setOperands(0, lower.size(), lower);
   cloned->setOperands(lower.size(), upper.size(), upper);
   cloned->setOperands(lower.size() + upper.size(), step.size(), step);
   cloned->moveBefore(block, block->begin());
 
-  // Move out memref.alloc/dealloc op from the loop op.
-  // They are used to manage the tile buffers. We can re-use these buffers cross
-  // iterations in the same thread.
-  SmallVector<Operation*> allocOps;
-  SmallVector<Operation*> deallocOps;
-  for (Operation& op : cloned.getLoopBody().front()) {
-    if (isa<memref::AllocOp>(&op)) {
-      allocOps.push_back(&op);
-    } else if (isa<memref::DeallocOp>(&op)) {
-      deallocOps.push_back(&op);
-    }
-  }
-  for (Operation* op : allocOps) {
-    op->moveBefore(cloned);
-  }
-  for (Operation* op : llvm::reverse(deallocOps)) {
-    op->moveAfter(cloned);
-  }
-
   if (cloned
           .walk([&](LoopLikeOpInterface loopLike) {
-            if (failed(moveLoopInvariantCode(loopLike)))
-              return WalkResult::interrupt();
+            moveLoopInvariantCode(loopLike);
             return WalkResult::advance();
           })
           .wasInterrupted()) {
     return failure();
   }
 
-  return moveLoopInvariantCode(cloned);
+  // Move out memref.alloc/dealloc op from the loop op.
+  // They are used to manage the tile buffers. We can re-use these buffers cross
+  // iterations in the same thread.
+  auto definedOutside = [&](Value value) {
+    auto loopLike = dyn_cast<LoopLikeOpInterface>(cloned.getOperation());
+    assert(loopLike);
+    return loopLike.isDefinedOutsideOfLoop(value);
+  };
+
+  struct AllocDeallocPair {
+    memref::AllocOp allocOp;
+    memref::DeallocOp deallocOp;
+  };
+  DenseMap<Value, AllocDeallocPair> allocAndDeallocPairs;
+  for (Operation& op : cloned.getLoopBody().front()) {
+    if (auto allocOp = dyn_cast<memref::AllocOp>(&op)) {
+      if (canBeHoisted(&op, definedOutside))
+        allocAndDeallocPairs[op.getResult(0)].allocOp = allocOp;
+    } else if (auto deallocOp = dyn_cast<memref::DeallocOp>(&op)) {
+      auto it = allocAndDeallocPairs.find(op.getOperand(0));
+      if (it != allocAndDeallocPairs.end()) it->second.deallocOp = deallocOp;
+    }
+  }
+  for (auto& pair : allocAndDeallocPairs) {
+    if (!pair.second.allocOp || !pair.second.deallocOp) continue;
+    pair.second.allocOp->moveBefore(cloned);
+    pair.second.deallocOp->moveAfter(cloned);
+  }
+
+  return success();
 }
 
 LogicalResult rewriteLaunchOpSetting(scf::ParallelOp parallelOp,
@@ -265,15 +301,14 @@ LogicalResult rewriteLaunchOpSetting(scf::ParallelOp parallelOp,
   Location loc = parallelOp.getLoc();
   OpBuilder builder(parallelOp);
   int numIvs = parallelOp.getInductionVars().size();
-  auto launchSettingType = MemRefType::get(
-      {numIvs}, builder.getIndexType(), MemRefLayoutAttrInterface(),
-      StringAttr::get(parallelOp->getContext(), placement_utils::kCpu));
+  auto launchSettingType = MemRefType::get({numIvs}, builder.getIndexType(),
+                                           MemRefLayoutAttrInterface());
   Value lowerBound = builder.create<memref::AllocaOp>(loc, launchSettingType);
   Value upperBound = builder.create<memref::AllocaOp>(loc, launchSettingType);
   Value step = builder.create<memref::AllocaOp>(loc, launchSettingType);
-  for (auto&& en : llvm::enumerate(llvm::zip(parallelOp.getLowerBound(),
-                                             parallelOp.getUpperBound(),
-                                             parallelOp.getStep()))) {
+  for (const auto&& en : llvm::enumerate(llvm::zip(parallelOp.getLowerBound(),
+                                                   parallelOp.getUpperBound(),
+                                                   parallelOp.getStep()))) {
     Value idx = builder.create<arith::ConstantIndexOp>(loc, en.index());
     builder.create<memref::StoreOp>(loc, std::get<0>(en.value()), lowerBound,
                                     idx);
@@ -288,7 +323,7 @@ LogicalResult rewriteLaunchOpSetting(scf::ParallelOp parallelOp,
   // We use a scf::if op as the wrapper op. The pred of the if op is a constant
   // true.
   Value pred = builder.create<arith::ConstantIntOp>(loc, 1, 1);
-  scf::IfOp ifOp = builder.create<scf::IfOp>(loc, llvm::None, pred, false);
+  scf::IfOp ifOp = builder.create<scf::IfOp>(loc, TypeRange{}, pred, false);
   Block* thenBlock = &ifOp.getThenRegion().getBlocks().front();
   parallelOp->moveBefore(thenBlock, thenBlock->begin());
   targetOp = ifOp;
@@ -312,7 +347,7 @@ LogicalResult rewriteLaunchOpSetting(scf::ParallelOp parallelOp,
         loc, arith::CmpIPredicate::eq, stepVec.back(), one);
     stepAllOnes = builder.create<arith::AndIOp>(loc, stepAllOnes, stepIsOne);
   }
-  ifOp = builder.create<scf::IfOp>(loc, llvm::None, stepAllOnes, true);
+  ifOp = builder.create<scf::IfOp>(loc, TypeRange{}, stepAllOnes, true);
   if (failed(cloneAndMoveTo(builder, parallelOp, lowerBoundVec, upperBoundVec,
                             stepOneVec,
                             &ifOp.getThenRegion().getBlocks().front()))) {
@@ -330,15 +365,15 @@ LogicalResult rewriteLaunchOpSetting(scf::ParallelOp parallelOp,
 struct DiscOutlineCpuKernel : DiscOutlineCpuKernelBase<DiscOutlineCpuKernel> {
   void runOnOperation() override {
     ModuleOp m = getOperation();
-    SmallVector<FuncOp> candidateFuncOps;
-    for (FuncOp func : m.getOps<FuncOp>()) {
+    SmallVector<func::FuncOp> candidateFuncOps;
+    for (func::FuncOp func : m.getOps<func::FuncOp>()) {
       if (func->getAttrOfType<UnitAttr>(kCpuKernelFunc)) continue;
       candidateFuncOps.push_back(func);
     }
     if (candidateFuncOps.empty()) return;
 
     SymbolTable symbolTable(getOperation());
-    for (FuncOp func : candidateFuncOps) {
+    for (func::FuncOp func : candidateFuncOps) {
       if (failed(processFunction(symbolTable, func))) {
         signalPassFailure();
         return;
@@ -346,11 +381,11 @@ struct DiscOutlineCpuKernel : DiscOutlineCpuKernelBase<DiscOutlineCpuKernel> {
     }
   }
 
-  LogicalResult processFunction(SymbolTable& symbolTable, FuncOp func);
+  LogicalResult processFunction(SymbolTable& symbolTable, func::FuncOp func);
 };
 
 LogicalResult DiscOutlineCpuKernel::processFunction(SymbolTable& symbolTable,
-                                                    FuncOp func) {
+                                                    func::FuncOp func) {
   SmallVector<scf::ParallelOp> parallelOps;
   func.walk([&](scf::ParallelOp op) {
     // skip nested parallel op.
@@ -364,7 +399,7 @@ LogicalResult DiscOutlineCpuKernel::processFunction(SymbolTable& symbolTable,
 
   // Insert just after the function.
   Block::iterator insertPt(func->getNextNode());
-  for (auto&& en : llvm::enumerate(parallelOps)) {
+  for (const auto&& en : llvm::enumerate(parallelOps)) {
     // operands for the outlined function.
     SmallVector<Value> operands;
     operands.push_back(func.getArgument(0));
@@ -389,7 +424,8 @@ LogicalResult DiscOutlineCpuKernel::processFunction(SymbolTable& symbolTable,
       return wrapperOp->emitError("failed to sink operations into parallel op");
     }
 
-    FuncOp outlinedFunc = outlineKernelFunc(wrapperOp, kernelFnName, operands);
+    func::FuncOp outlinedFunc =
+        outlineKernelFunc(wrapperOp, kernelFnName, operands);
     symbolTable.insert(outlinedFunc, insertPt);
     convertToLaunchFuncOp(wrapperOp, outlinedFunc, operands);
   }

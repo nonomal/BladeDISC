@@ -14,7 +14,7 @@
 #endif
 
 #include "llvm/Support/CommandLine.h"
-#include "tensorflow/compiler/mlir/disc/tools/disc-replay/disc_interpreter.h"
+#include "mlir/disc/tools/disc-replay/disc_interpreter.h"
 #include "tensorflow/core/platform/errors.h"
 
 tensorflow::Status RealMain(int argc, char** argv) {
@@ -69,13 +69,13 @@ tensorflow::Status RealMain(int argc, char** argv) {
 #if GOOGLE_CUDA
   if (enable_nvprof) cudaProfilerStop();
 #endif
-  return tensorflow::Status::OK();
+  return tsl::OkStatus();
 }
 
 int main(int argc, char** argv) {
   auto s = RealMain(argc, argv);
   if (!s.ok()) {
-    VLOG(0) << "replay failed " << s.error_message();
+    VLOG(0) << "replay failed " << s.ToString();
     return 1;
   }
   return 0;

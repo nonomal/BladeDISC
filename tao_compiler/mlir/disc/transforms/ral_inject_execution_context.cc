@@ -47,7 +47,8 @@ limitations under the License.
 // to the entry function. Thus, we don't rewrite all call ops and other
 // functions a.t.m. Re-visit this assumption if necessary.
 
-#include "mlir/Dialect/StandardOps/IR/Ops.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Attributes.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -56,8 +57,8 @@ limitations under the License.
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/Pass/Pass.h"
-#include "tensorflow/compiler/mlir/disc/IR/disc_ral_ops.h"
-#include "tensorflow/compiler/mlir/disc/transforms/PassDetail.h"
+#include "mlir/disc/IR/disc_ral_ops.h"
+#include "mlir/disc/transforms/PassDetail.h"
 
 namespace mlir {
 namespace disc_ral {
@@ -78,14 +79,14 @@ struct RalInjectExecutionContextPass
 
   void runOnOperation() override {
     ModuleOp m = getOperation();
-    FuncOp main = m.lookupSymbol<FuncOp>(entry_func_name_);
+    func::FuncOp main = m.lookupSymbol<func::FuncOp>(entry_func_name_);
     if (!main) {
       m.emitError("entry func: " + entry_func_name_ + " not found");
       signalPassFailure();
     }
 
     Location loc = main.getLoc();
-    FunctionType funcType = main.getType();
+    FunctionType funcType = main.getFunctionType();
     OpBuilder b(&main.getBody());
     Block* entry_block = &main.getBody().front();
     Type ctx_type = RalExecutionContextType::get(b.getContext());
@@ -94,7 +95,7 @@ struct RalInjectExecutionContextPass
     Value ctx = entry_block->insertArgument(0u, ctx_type, loc);
 
     // 2. remap original arguments to recv_input ops
-    for (auto&& en : llvm::enumerate(
+    for (const auto&& en : llvm::enumerate(
              llvm::zip(funcType.getInputs(),
                        entry_block->getArguments().drop_front(1)))) {
       Value idx = b.create<arith::ConstantIndexOp>(loc, en.index());
@@ -110,7 +111,7 @@ struct RalInjectExecutionContextPass
       Operation& operation = block.back();
       if (!operation.hasTrait<OpTrait::ReturnLike>()) continue;
       b.setInsertionPoint(&operation);
-      for (auto& en : llvm::enumerate(operation.getOperands())) {
+      for (const auto& en : llvm::enumerate(operation.getOperands())) {
         Value idx = b.create<arith::ConstantIndexOp>(loc, en.index());
         b.create<SendOutputOp>(loc, ctx, idx, en.value());
       }

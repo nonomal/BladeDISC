@@ -18,25 +18,22 @@
 from __future__ import print_function
 
 import argparse
-import glob
 import os
 import re
-import shutil
 import socket
 import tarfile
-import time
 import fnmatch
 from datetime import datetime
 
 from common_setup import (
-    StageTiming,
     stage_time,
     time_stage,
     build_mkldnn,
     config_mkldnn,
-    mkl_install_dir,
-    symlink_files,
-    ensure_empty_dir,
+    symlink_disc_files,
+    internal_root_dir,
+    tao_bridge_dir,
+    get_version_file,
     cwd,
     get_source_root_dir,
     logger,
@@ -45,9 +42,14 @@ from common_setup import (
     ci_build_flag,
     remote_cache_token,
     update_cpu_specific_setting,
-    acl_root_dir,
     get_tf_info,
     deduce_cuda_info,
+    configure_bridge_platform_alibaba,
+    configure_compiler_platform_alibaba,
+    build_tao_compiler_add_flags_platform_alibaba,
+    test_tao_compiler_add_flags_platform_alibaba,
+    add_arguments_common,
+    num_make_jobs
 )
 
 from tao_common import (
@@ -56,17 +58,17 @@ from tao_common import (
     git_head,
     get_tf_gpu_version,
     execute,
-    default_env,
     gcc_env,
-    overwrite_file,
 )
 
 PYTHON_BIN_NAME = os.getenv("PYTHON", "python")
 
-def get_version_file(root=None):
-    if root is None:
-        root = get_source_root_dir()
-    return os.path.join(root, "VERSION")
+def get_rocm_path(args):
+    if args.rocm_path is not None:
+        rocm_env = args.rocm_path
+    else:
+        rocm_env = os.environ.get("ROCM_PATH", "/opt/rocm")
+    return rocm_env
 
 
 def tf_root_dir(root=None):
@@ -81,59 +83,22 @@ def tao_compiler_dir(root=None):
     return os.path.join(root, "tao_compiler")
 
 
-def tao_bridge_dir(root=None):
-    if root is None:
-        root = get_source_root_dir()
-    return os.path.join(root, "tao", "tao_bridge")
-
-
 def tao_build_dir(root=None):
     if root is None:
         root = get_source_root_dir()
     return os.path.join(root, "tao", "build")
+
 
 def tao_bazel_dir(root=None):
     if root is None:
         root = get_source_root_dir()
     return os.path.join(root, "tao")
 
-def tao_ral_dir(root=None):
-    if root is None:
-        root = get_source_root_dir()
-    return os.path.join(root, "tao", "tao_bridge", "ral")
-
-def internal_root_dir():
-    return os.path.join(get_source_root_dir(), os.pardir)
-
-def internal_tao_bridge_dir():
-    return os.path.join(internal_root_dir(), "platform_alibaba", "tao_bridge")
 
 def blade_gemm_dir(root=None):
     if root is None:
         root = get_source_root_dir()
     return os.path.join(root, os.pardir, "platform_alibaba", "blade_gemm", "build")
-
-
-def link_internal_tao_bridge(args):
-    # softlink ["tao_launch_op", "gpu"] dirs, "tvm" and "transform" dirs are not needed for now.
-    for dir_name in ["tao_launch_op", "gpu"]:
-        src_file = os.path.join(internal_tao_bridge_dir(), dir_name)
-        link_in_bridge = os.path.join(tao_bridge_dir(), dir_name)
-        if args.platform_alibaba:
-            execute("rm -rf {0} && ln -s {1} {0}".format(link_in_bridge, src_file))
-        else:
-            execute("rm -rf {0}".format(link_in_bridge))
-
-def add_ral_link_if_not_exist(root):
-    RAL_DIR_IN_TF = "tao_compiler/mlir/xla"
-    PROTO = "compile_metadata.proto"
-    RAL_DIR_IN_BRIDGE = os.path.join(tao_ral_dir(root), "tensorflow/compiler/mlir/xla")
-    if os.path.exists(RAL_DIR_IN_BRIDGE):
-        shutil.rmtree(RAL_DIR_IN_BRIDGE)
-    os.makedirs(RAL_DIR_IN_BRIDGE)
-    with cwd(RAL_DIR_IN_BRIDGE):
-        execute("ln -s {0}/{1}/ral ral".format(root, RAL_DIR_IN_TF))
-        execute("ln -s {0}/{1}/ral/{2} {2}".format(root, RAL_DIR_IN_TF, PROTO))
 
 
 def tao_ci_conf_file():
@@ -159,27 +124,10 @@ def restore_gcc_conf(args):
             v = v.strip()
             setattr(args, k, v)
 
-def symlink_internal_files(root):
-    with cwd(root):
-        logger.info("linking PatineClient")
-        execute("rm -rf {0} && ln -s {1} {0}".format(os.path.join('tf_community', 'tao', 'third_party', 'PatineClient'),
-                os.path.join(internal_root_dir(), 'platform_alibaba', 'third_party', 'PatineClient')))
-        logger.info("linking blade_gemm")
-        execute("rm -rf {0} && ln -s {1} {0}".format(os.path.join('tf_community', 'tao', 'blade_gemm'),
-                os.path.join(internal_root_dir(), 'platform_alibaba', 'blade_gemm')))
-
-        logger.info("cleanup tao_compiler with XLA always...")
-        src = os.path.join(internal_root_dir(), "platform_alibaba/tao_compiler/xla")
-        dest = "tf_community/tensorflow/compiler/decoupling_xla"
-        execute("rm -rf {1} && ln -s {0} {1}".format(src, dest))
-
 
 def configure_compiler(root, args):
-    symlink_files(root)
-    if args.platform_alibaba:
-        symlink_internal_files(root)
-
-    config_blade_gemm(root, args)
+    def _action_env(key, value, cmd="build"):
+        f.write(f"{cmd} --action_env {key}={value}\n")
     # configure tensorflow
     with cwd(tf_root_dir()), gcc_env(args.compiler_gcc):
         cmd = "set -a && source {} && set +a &&".format(
@@ -205,104 +153,21 @@ def configure_compiler(root, args):
             f.write("\n")
             bazel_startup_opts = "--host_jvm_args=-Djdk.http.auth.tunneling.disabledSchemes="
             f.write("startup {}\n".format(bazel_startup_opts))
+            if args.dcu or args.rocm:
+                _action_env("ROCM_PATH", get_rocm_path(args))
+            if args.cpu_only and args.aarch64:
+                _action_env("DISC_TARGET_CPU_ARCH", args.target_cpu_arch or "arm64-v8a")
+            _action_env("DISC_FOREIGN_MAKE_JOBS", num_make_jobs())
 
+    configure_compiler_platform_alibaba(root, args)
     logger.info("Stage [configure compiler] success.")
 
 @time_stage()
-def configure_pytorch(root, args):
-    save_gcc_conf(args)
-    logger.info("configuring aicompiler for pytorch ......")
-    config_blade_gemm(root, args)
-    configure_compiler(root, args)
-
-@time_stage()
-def configure_bridge_cmake(root, args):
-    save_gcc_conf(args)
-    add_ral_link_if_not_exist(root)
-    tao_bridge_build_dir = tao_build_dir(root)
-    ensure_empty_dir(tao_bridge_build_dir, clear_hidden=False)
-    with cwd(tao_bridge_build_dir), gcc_env(args.bridge_gcc):
-        cc = which("gcc")
-        cxx = which("g++")
-        envs = " CC={} CXX={} ".format(cc, cxx)
-        if args.build_in_tf_addon:
-            # called from tensorflow_addons
-            flags = "-DTAO_ENABLE_WARMUP_XFLOW=OFF"
-        else:
-            # default flags
-            flags = "-DTAO_ENABLE_CXX_TESTING=ON"
-        flags += " -DTAO_DISABLE_LINK_TF_FRAMEWORK={} ".format(
-            "ON" if args.disable_link_tf_framework else "OFF"
-        )
-        if args.enable_blaze_opt:
-            flags += " -DBLAZE_OPT=true"
-        flags += " -DTAO_CPU_ONLY={}".format(args.cpu_only)
-        flags += " -DTAO_DCU={}".format(args.dcu)
-        is_cuda = not (args.cpu_only or args.dcu)
-        flags += " -DTAO_CUDA={}".format(is_cuda)
-        flags += " -DTAO_ENABLE_MKLDNN={} ".format(
-            "ON" if args.enable_mkldnn else "OFF"
-        )
-        if args.enable_mkldnn:
-            flags +=" -DMKL_ROOT={} ".format(mkl_install_dir(root))
-        flags += " -DTAO_X86={}".format(args.x86)
-        flags += " -DTAO_AARCH64={}".format(args.aarch64)
-        if args.aarch64:
-            acl_root = acl_root_dir(root)
-            envs += " ACL_ROOT_DIR={} ".format(acl_root)
-            flags += " -DDNNL_AARCH64_USE_ACL=ON "
-
-        cmake_cmd = (
-            "{} cmake .. -DPYTHON={}/bin/{} {}".format(
-                envs, args.venv_dir, PYTHON_BIN_NAME, flags
-            )
-        )
-        logger.info("configuring tao_bridge ......")
-        execute(cmake_cmd)
-
-    with cwd(root):
-        # copy version.h from tao_bridge
-        execute(
-            "cp {}/tao_bridge/version.h tao_compiler/decoupling/version.h".format(
-                tao_bridge_build_dir
-            )
-        )
-    logger.info("Stage [configure bridge(cmake)] success.")
-
-def config_blade_gemm(root, args):
-    if not (args.platform_alibaba and args.blade_gemm):
-        return
-    if args.cpu_only or args.dcu:
-        return
-    blade_gemm_build_dir = blade_gemm_dir(root)
-    ensure_empty_dir(blade_gemm_build_dir, clear_hidden=False)
-    with cwd(blade_gemm_build_dir), gcc_env(args.bridge_gcc):
-        cc = which("gcc")
-        cxx = which("g++")
-        cmake_cmd = "CC={} CXX={} CUDA_CXX={} cmake .. -DBLADE_GEMM_NVCC_ARCHS='80' -DBLADE_GEMM_LIBRARY_KERNELS=s1688tf32gemm,f16_s1688gemm_f16,f16_s16816gemm_f16,s16816tf32gemm".format(cc, cxx, args.blade_gemm_nvcc)
-        logger.info("configuring blade_gemm ......")
-        execute(cmake_cmd)
-        logger.info("blade_gemm configure success.")
-
-@time_stage()
-def build_blade_gemm(root, args):
-    if not (args.platform_alibaba and args.blade_gemm):
-        return
-    if args.cpu_only or args.dcu:
-        return
-    blade_gemm_build_dir = blade_gemm_dir(root)
-    with cwd(blade_gemm_build_dir), gcc_env(args.bridge_gcc):
-        execute("make -j")
-    logger.info("Stage [build_blade_gemm] success.")
-
-
-@time_stage()
-def configure_bridge_bazel(root, args):
+def configure_bridge(root, args):
     save_gcc_conf(args)
     # TODO(lanbo.llb): support tf_addons build with bazel
     # TODO(lanbo.llb): support TAO_DISABLE_LINK_TF_FRAMEWORK in bazel??
     tao_bazel_root = tao_bazel_dir(root)
-    link_internal_tao_bridge(args)
     with gcc_env(args.bridge_gcc), open(os.path.join(tao_bazel_root, ".bazelrc_gen"), "w") as f:
 
         def _opt(opt, value, cmd="build"):
@@ -319,6 +184,9 @@ def configure_bridge_bazel(root, args):
         _action_env("GCC_HOST_COMPILER_PATH", os.path.realpath(which("gcc")))
         _action_env("CC", os.path.realpath(which("gcc")))
         _action_env("CXX", os.path.realpath(which("g++")))
+        _action_env("DISC_FOREIGN_MAKE_JOBS", num_make_jobs())
+        if args.dcu or args.rocm:
+            _action_env("ROCM_PATH", get_rocm_path(args))
         (
             tf_major,
             tf_minor,
@@ -350,7 +218,7 @@ def configure_bridge_bazel(root, args):
         _action_env("DISC_BUILD_IP", ip)
         _action_env("DISC_BUILD_TIME", datetime.today().strftime("%Y%m%d%H%M%S"))
 
-        is_cuda = not (args.cpu_only or args.dcu)
+        is_cuda = not (args.cpu_only or args.dcu or args.rocm)
         if is_cuda:
             cuda_ver, _ = deduce_cuda_info()
             logger.info(f"Builing with cuda-{cuda_ver}")
@@ -359,8 +227,6 @@ def configure_bridge_bazel(root, args):
                 if args.platform_alibaba and args.blade_gemm:
                     if os.path.exists(args.blade_gemm_nvcc):
                         _action_env("BLADE_GEMM_NVCC", args.blade_gemm_nvcc)
-                        _action_env("BLADE_GEMM_NVCC_ARCHS", "80")  # Currently only for Ampere, add a arg for this when support more archs
-                        _action_env("BLADE_GEMM_LIBRARY_KERNELS", "s1688tf32gemm,f16_s1688gemm_f16,f16_s16816gemm_f16,s16816tf32gemm")
                     else:
                         raise Exception(f"blade_gemm_gcc in args {args.blade_gemm_nvcc} not exists")
             elif cuda_ver.startswith('10.'):
@@ -369,44 +235,46 @@ def configure_bridge_bazel(root, args):
             _write("--test_tag_filters=-cpu", cmd="test")
         elif args.cpu_only:
             _write("--test_tag_filters=-gpu", cmd="test")
-            if args.enable_mkldnn:
-                _action_env("BUILD_WITH_MKLDNN", "1")
             if args.aarch64:
                 _action_env("BUILD_WITH_AARCH64", "1")
+                _action_env("DISC_TARGET_CPU_ARCH", args.target_cpu_arch or "arm64-v8a")
+        else:
+            if args.platform_alibaba and args.blade_gemm:
+                _action_env("BLADE_GEMM_TVM", "ON")
+                _action_env("BLADE_GEMM_ROCM_PATH", get_rocm_path(args))
+
 
         _write("--host_jvm_args=-Djdk.http.auth.tunneling.disabledSchemes=", cmd = "startup")
         logger.info("configuring tao_bridge with bazel ......")
 
-    proxy_setting = "HTTPS_PROXY= " if args.platform_alibaba else ""
     with cwd(tao_bazel_root), gcc_env(args.bridge_gcc):
         # make sure version.h is generated
-        execute(f"{proxy_setting} bazel build --config=release //:version_header_genrule")
+        execute(f"bazel build --config=release //:version_header_genrule")
 
     with cwd(root):
         # copy version.h from tao_bridge
         # NOTE(lanbo.llb): This is no longer needed when tao_compiler is build
         # in workspace `org_tao_compiler` instead of `org_tensorflow`
         execute(
-            f"cp {tao_bazel_root}/bazel-bin/tao_bridge/version.h tao_compiler/decoupling/version.h"
+            f"cp -f {tao_bazel_root}/bazel-bin/tao_bridge/version.h tao_compiler/decoupling/version.h"
         )
+    configure_bridge_platform_alibaba(root, args)
     logger.info("Stage [configure bridge(bazel)] success.")
 
 
 @time_stage()
 def configure(root, args):
-    if args.cmake:
-        configure_bridge_cmake(root, args)
-    else:
-        configure_bridge_bazel(root, args)
+    symlink_disc_files(args)
+    configure_bridge(root, args)
     configure_compiler(root, args)
 
 
 @time_stage()
 def build_tao_compiler(root, args):
-    BAZEL_BUILD_CMD = "bazel build --experimental_multi_threaded_digest --define framework_shared_object=false" + ci_build_flag()
-    TARGET_TAO_COMPILER_MAIN = "//tensorflow/compiler/decoupling:tao_compiler_main"
-    TARGET_DISC_OPT = "//tensorflow/compiler/mlir/disc:disc-opt"
-    TARGET_DISC_REPLAY = "//tensorflow/compiler/mlir/disc/tools/disc-replay:disc-replay-main"
+    BAZEL_BUILD_CMD = "bazel build --verbose_failures --experimental_multi_threaded_digest --define framework_shared_object=false" + ci_build_flag()
+    TARGET_TAO_COMPILER_MAIN = "//decoupling:tao_compiler_main"
+    TARGET_DISC_OPT = "//mlir/disc:disc-opt"
+    TARGET_DISC_REPLAY = "//mlir/disc/tools/disc-replay:disc-replay-main"
 
     targets = None
     if args.bazel_target is not None:
@@ -420,9 +288,9 @@ def build_tao_compiler(root, args):
         logger.info("Building bazel target: " + target)
         execute(" ".join([BAZEL_BUILD_CMD, flag, target]))
 
-    with cwd(tf_root_dir(root)), gcc_env(args.compiler_gcc):
+    with cwd(os.path.join(root, "tao_compiler")), gcc_env(args.compiler_gcc):
         execute(
-            "cp -f -p {}/tao*.proto tensorflow/compiler/decoupling/".format(
+            "cp -f -p {}/tao*.proto decoupling/".format(
                 tao_bridge_dir(root)
             )
         )
@@ -434,13 +302,16 @@ def build_tao_compiler(root, args):
                 flag = '--config=disc_x86 '
         elif args.dcu:
             flag = "--config=dcu"
+        elif args.rocm:
+            flag = "--config=rocm"
         else:
             flag = "--config=cuda"
-            if args.platform_alibaba and args.blade_gemm:
-                flag += " --config=blade_gemm"
 
         if args.platform_alibaba:
             flag += " --config=platform_alibaba"
+
+        if args.rocm_toolkit_codegen:
+            flag += ' --cxxopt="-DTENSORFLOW_USE_ROCM_COMPILE_TOOLKIT=1"'
 
         if args.build_dbg_symbol:
             flag += " --copt=-g"
@@ -451,11 +322,18 @@ def build_tao_compiler(root, args):
         if args.enable_mkldnn:
             flag += ' --config=disc_mkldnn'
 
+        if args.skip_compute_intensive_fusion:
+            flag += ' --config=skip_compute_intensive_fusion'
+
+        flag = build_tao_compiler_add_flags_platform_alibaba(root, args, flag)
+
         bazel_build(TARGET_TAO_COMPILER_MAIN, flag=flag)
         bazel_build(TARGET_DISC_OPT, flag=flag)
-        bazel_build(TARGET_DISC_REPLAY, flag=flag)
+        # TODO:(fl237079) Support disc_replay for rocm version
+        if not args.rocm and not args.dcu:
+            bazel_build(TARGET_DISC_REPLAY, flag=flag)
         execute(
-            "cp -f -p {}/tao/third_party/ptxas/10.2/ptxas ./bazel-bin/tensorflow/compiler/decoupling/".format(
+            "cp -f -p {}/tao/third_party/ptxas/10.2/ptxas ./bazel-bin/decoupling/".format(
                 root
             )
         )
@@ -463,88 +341,37 @@ def build_tao_compiler(root, args):
 
 
 @time_stage()
-def build_mlir_ral(root, args):
-    configs = ['--config=cxx11abi_{}'.format(int(args.ral_cxx11_abi))]
-    if not args.cpu_only:
-        if args.dcu:
-            configs.append('--config=disc_dcu')
-        else:
-            configs.append('--config=disc_cuda')
-            if args.platform_alibaba and args.blade_gemm:
-                configs.append('--config=blade_gemm')
-    else:
-        if args.aarch64:
-            configs.append('--config=disc_aarch64')
-        else:
-            configs.append('--config=disc_x86')
-
-    if args.platform_alibaba:
-        configs.append(" --config=platform_alibaba")
-
-
-
-    if args.enable_blaze_opt:
-        configs.append('--config=disc_blaze')
-
-    if args.enable_mkldnn:
-        configs.append('--config=disc_mkldnn')
-
-    if running_on_ci():
-        configs.append('--config=ci_build')
-
-    BAZEL_BUILD_CMD = "bazel build --config=disc "
-    BAZEL_BUILD_CMD = BAZEL_BUILD_CMD + " ".join(configs)
-
-    TARGET_RAL_STANDALONE_LIB = "//tensorflow/compiler/mlir/xla/ral:libral_base_context.so"
-    TARGET_DHLO_COMPILER_MAIN = "//tensorflow/compiler/mlir/disc:disc_compiler_main"
-    TARGET_MLIR_DISC_BUILDER = "//tensorflow/compiler/mlir/disc:mlir_disc_builder.so"
-    TARGET_MLIR_DISC_BUILDER_HEADER = "//tensorflow/compiler/mlir/disc:install_mlir_disc_headers"
-
-    def bazel_build(target, flag=""):
-        logger.info("Building bazel target: " + target)
-        execute(" ".join([BAZEL_BUILD_CMD, flag, target]))
-
-    flag = ""
-    with cwd(tf_root_dir(root)), gcc_env(args.bridge_gcc):
-        bazel_build(TARGET_RAL_STANDALONE_LIB, flag=flag)
-        bazel_build(TARGET_MLIR_DISC_BUILDER, flag=flag)
-        bazel_build(TARGET_MLIR_DISC_BUILDER_HEADER, flag=flag)
-
-    with cwd(tf_root_dir(root)), gcc_env(args.compiler_gcc):
-        if not args.cpu_only:
-            # A workaround for a bug of gcc<=7.3 since devtoolset-7 supports up to 7.3.1
-            # and cuda-10 runtime cannot support devtools-8 for now.
-            # Revisit this if upgrade to devtools-8.
-            # Refer to: https://github.com/tensorflow/tensorflow/issues/25323
-            execute("sed -i \
-                's/values\[i\] = coeff(index+i);/Self::CoeffReturnType t = coeff(index+i);values\[i\] = t;/g' \
-                'bazel-tf_community/external/eigen_archive/unsupported/Eigen/CXX11/src/Tensor/TensorImagePatch.h'")
-            execute("sed -i \
-                '/values\[i\] = internal::InnerMostDimReducer<Self, Op>::reduce(\*this, firstIndex + i \* num_values_to_reduce,$/{n;d}' \
-                'bazel-tf_community/external/eigen_archive/unsupported/Eigen/CXX11/src/Tensor/TensorReduction.h'")
-            execute("sed -i \
-                's/values\[i\] = internal::InnerMostDimReducer<Self, Op>::reduce(\*this, firstIndex + i \* num_values_to_reduce,$/CoeffReturnType t = internal::InnerMostDimReducer<Self, Op>::reduce(\*this, firstIndex + i \* num_values_to_reduce, num_values_to_reduce, reducer)\;values\[i\] = t\;/g' \
-                'bazel-tf_community/external/eigen_archive/unsupported/Eigen/CXX11/src/Tensor/TensorReduction.h'")
-        bazel_build(TARGET_DHLO_COMPILER_MAIN, flag=flag)
-
-    logger.info("Stage [build_mlir_ral] success.")
-
-@time_stage()
 def test_tao_compiler(root, args):
-    BAZEL_BUILD_CMD = "bazel build --experimental_multi_threaded_digest --define framework_shared_object=false --test_timeout=600 --javabase=@bazel_tools//tools/jdk:remote_jdk11"
+    BAZEL_BUILD_CMD = "bazel build --verbose_failures --experimental_multi_threaded_digest --define framework_shared_object=false --test_timeout=600 --javabase=@bazel_tools//tools/jdk:remote_jdk11"
     BAZEL_TEST_CMD = "bazel test --experimental_multi_threaded_digest --define framework_shared_object=false --test_timeout=600 --javabase=@bazel_tools//tools/jdk:remote_jdk11"
     BAZEL_TEST_CMD += ci_build_flag()
     BAZEL_BUILD_CMD += ci_build_flag()
     if running_on_ci():
         # NOTE: using the lower parallel jobs on CI host to avoid OOM
-        BAZEL_TEST_CMD += " --jobs=10"
+        BAZEL_TEST_CMD += " --jobs=10 --test_output=errors"
     else:
         BAZEL_TEST_CMD += " --jobs=30"
+        BAZEL_TEST_CMD += " --java_runtime_version=remotejdk_11"
+        BAZEL_BUILD_CMD += " --java_runtime_version=remotejdk_11"
 
-    TARGET_DISC_TRANSFORMS_TEST = "//tensorflow/compiler/mlir/disc/transforms/tests/..."
-    TARGET_DISC_E2E_TEST = "//tensorflow/compiler/mlir/disc/tests/..."
+    TARGET_DISC_IR_TEST = "//mlir/disc/IR/tests/..."
+    TARGET_DISC_TRANSFORMS_TEST = "//mlir/disc/transforms/tests/..."
+    TARGET_DISC_E2E_TEST = "//mlir/disc/tests/..."
+    TARGET_DISC_RAL_TESTS = [
+        "//mlir/ral:ral_metadata_test"
+    ]
+    TARGET_DISC_PDLL_TESTS = [
+        "//mlir/disc/tools/disc-pdll/tests/..."
+    ]
+    TARGET_DISC_CUDA_SOURCE_TESTS = [
+        "//mlir/disc/tools/disc-source-emitter/tests/..."
+    ]
+    TARGET_DISC_TRANSFORM_DIALECT_TESTS = [
+        "//mlir/disc/tools/disc-transform/transforms/tests/...",
+        "//mlir/disc/tools/disc-transform/LinalgExt/tests/...",
+    ]
 
-    TARGET_DISC_REPLAY_TEST = "//tensorflow/compiler/mlir/disc/tools/disc-replay:disc-replay-test"
+    TARGET_DISC_REPLAY_TEST = "//mlir/disc/tools/disc-replay:disc-replay-test"
 
     targets = None
     if args.bazel_target is not None:
@@ -555,13 +382,13 @@ def test_tao_compiler(root, args):
         if targets is not None and target not in targets:
             return
         logger.info("Testing bazel target: " + target)
+        flag += " --experimental_ui_max_stdouterr_bytes=-1 "
         execute(" ".join([BAZEL_BUILD_CMD, flag, target]))
-        execute(" ".join([BAZEL_TEST_CMD, flag + ' --test_env=TF_CPP_VMODULE=disc_compiler=1' , target]))
+        execute(" ".join([BAZEL_TEST_CMD, flag + ' --test_env=TF_CPP_VMODULE=disc_compiler=1,disc_transform_legalize_to_loop=1 --test_env=TF_ENABLE_ONEDNN_OPTS=0' , target]))
 
-    build_blade_gemm(root, args)
-    with cwd(tf_root_dir(root)), gcc_env(args.compiler_gcc):
+    with cwd(os.path.join(root, "tao_compiler")), gcc_env(args.compiler_gcc):
         execute(
-            "cp -f -p {}/tao*.proto tensorflow/compiler/decoupling/".format(
+            "cp -f -p {}/tao*.proto decoupling/".format(
                 tao_bridge_dir(root)
             )
         )
@@ -574,26 +401,40 @@ def test_tao_compiler(root, args):
                 flag += ' --config=disc_mkldnn'
             if args.platform_alibaba:
                 flag += " --config=platform_alibaba"
+            flag += ' --test_tag_filters=-gpu'
             mlir_test_list = [
+                TARGET_DISC_IR_TEST,
                 TARGET_DISC_TRANSFORMS_TEST,
                 TARGET_DISC_E2E_TEST,
-            ]
+            ] + TARGET_DISC_RAL_TESTS \
+              + TARGET_DISC_TRANSFORM_DIALECT_TESTS \
+              + TARGET_DISC_PDLL_TESTS
             MLIR_TESTS = " ".join(mlir_test_list)
             bazel_test(MLIR_TESTS, flag=flag)
         else:
             if args.dcu:
                 flag = "--config=dcu"
+            if args.rocm:
+                flag = "--config=rocm"
             else:
                 flag = "--config=cuda"
-                if args.platform_alibaba and args.blade_gemm:
-                    flag += ' --config=blade_gemm'
             if args.platform_alibaba:
                 flag += " --config=platform_alibaba"
+            if args.rocm_toolkit_codegen:
+                flag += ' --cxxopt="-DTENSORFLOW_USE_ROCM_COMPILE_TOOLKIT=1"'
+
+            flag = test_tao_compiler_add_flags_platform_alibaba(root, args, flag)
+            flag += ' --test_tag_filters=-no_gpu'
+
             mlir_tests_list = [
+                TARGET_DISC_IR_TEST,
                 TARGET_DISC_TRANSFORMS_TEST,
                 TARGET_DISC_E2E_TEST,
-                TARGET_DISC_REPLAY_TEST
-            ]
+                TARGET_DISC_REPLAY_TEST,
+            ] + TARGET_DISC_RAL_TESTS \
+              + TARGET_DISC_PDLL_TESTS \
+              + TARGET_DISC_CUDA_SOURCE_TESTS \
+              + TARGET_DISC_TRANSFORM_DIALECT_TESTS
             MLIR_TESTS = " ".join(mlir_tests_list)
             bazel_test(MLIR_TESTS, flag=flag)
             flag += " --action_env=BRIDGE_ENABLE_TAO=true "
@@ -610,44 +451,31 @@ def tao_bridge_bazel_config(args):
             bazel_config += " --config=disc_aarch64"
         if args.enable_mkldnn:
             bazel_config += " --config=disc_mkldnn"
+    elif args.rocm:
+        bazel_config += " --config=disc_rocm"
+        if args.platform_alibaba and args.blade_gemm:
+            bazel_config += " --config=blade_gemm"
     elif args.dcu:
         bazel_config += " --config=disc_dcu"
+        if args.platform_alibaba and args.blade_gemm:
+            bazel_config += " --config=blade_gemm"
     else:
         bazel_config += " --config=disc_cuda"
         if args.platform_alibaba and args.blade_gemm:
             bazel_config += " --config=blade_gemm"
+            bazel_config += " --config=disc_mkldnn"
     if args.platform_alibaba:
         bazel_config += " --config=platform_alibaba"
     return bazel_config
 
 @time_stage()
 def build_tao_bridge(root, args):
-    if args.cmake:
-        tao_bridge_build_dir = tao_build_dir(root)
-        with cwd(tao_bridge_build_dir), gcc_env(args.bridge_gcc):
-            execute("make -j")
-    else:
-        tao_bazel_root = tao_bazel_dir(root)
-        proxy_setting = "HTTPS_PROXY= " if args.platform_alibaba else ""
-        with cwd(tao_bazel_root), gcc_env(args.bridge_gcc):
-            execute(f"{proxy_setting} bazel build {tao_bridge_bazel_config(args)} //:libtao_ops.so")
+    tao_bazel_root = tao_bazel_dir(root)
+    with cwd(tao_bazel_root), gcc_env(args.bridge_gcc):
+        execute(f"bazel build {tao_bridge_bazel_config(args)} //:libtao_ops.so")
 
     logger.info("Stage [build_tao_bridge] success.")
 
-
-@time_stage()
-def build_dsw(root, args):
-    dsw_build_dir = os.path.join(root, "platform_alibaba", "tools", "tao")
-    # copy VERSION file
-    overwrite_file(get_version_file(), os.path.join(dsw_build_dir, "tao", "VERSION"))
-
-    with cwd(dsw_build_dir), gcc_env(args.bridge_gcc):
-        # remove previous build results
-        for tmpdir in ["build", "dist", "tao.egg-info"]:
-            if os.path.exists(tmpdir):
-                shutil.rmtree(tmpdir)
-        execute("{}/bin/python setup.py bdist_wheel --universal".format(args.venv_dir))
-    logger.info("Stage [build_dsw] success.")
 
 def py_test_reader(root, includes):
     includes = r'|'.join([fnmatch.translate(x) for x in includes])
@@ -684,50 +512,33 @@ def run_py_test(py_bin, test_root, output_file, includes, envs=[]):
 
 @time_stage()
 def test_tao_bridge(root, args, cpp=True, python=True):
-    if args.cmake:
-        tao_bridge_build_dir = tao_build_dir(root)
-        # Perform test within tao bridge GCC environment.
-        with cwd(tao_bridge_build_dir), gcc_env(args.bridge_gcc):
-            if cpp:
-                output_file = os.path.join(tao_bridge_build_dir, "cpp_test.out")
-                execute("make test ARGS='-V' | tee {}".format(output_file))
-                logger.info("Stage [test_tao_bridge_cpp] success, output: " + output_file)
-            if python:
-                output_file = os.path.join(tao_bridge_build_dir, "py_test.out")
-                py_bin = os.path.join(args.venv_dir, "bin", PYTHON_BIN_NAME)
-                test_root_disc = "{}/tao/tao_bridge/test/gpu".format(root)
+    tao_bazel_root = tao_bazel_dir(root)
+    with cwd(tao_bazel_root), gcc_env(args.bridge_gcc):
+        if cpp:
+            output_file = os.path.join(tao_bazel_root, "cpp_test.out")
+            execute(f"bazel test {tao_bridge_bazel_config(args)} //...")
+            logger.info("Stage [test_tao_bridge_cpp] with bazel success, output: " + output_file)
+        if python:
+            output_file = os.path.join(tao_bazel_root, "py_test.out")
+            py_bin = os.path.join(args.venv_dir, "bin", PYTHON_BIN_NAME)
+            test_root_disc = "{}/tao/tao_bridge/test/gpu".format(root)
+            test_root_cpu = "{}/platform_alibaba/tao_bridge/test/cpu".format(internal_root_dir())
+            test_root_gpu = "{}/platform_alibaba/tao_bridge/test/gpu".format(internal_root_dir())
+
+            if args.platform_alibaba:
+                if args.cpu_only:
+                    run_py_test(py_bin, test_root_cpu, output_file, ["test_*.py"],
+                        ["PLATFORM_ALIBABA=ON"])
+                else:
+                    run_py_test(py_bin, test_root_gpu, output_file, ["test_*.py"],
+                        ["PLATFORM_ALIBABA=ON"])
+                    run_py_test(py_bin, test_root_disc, output_file, ["test_mlir*.py"],
+                        ["PLATFORM_ALIBABA=ON"])
+            else:
                 if not args.cpu_only:
                     run_py_test(py_bin, test_root_disc, output_file, ["test_mlir*.py"])
 
-                logger.info("Stage [test_tao_bridge_py] success, output: " + output_file)
-    else:
-        tao_bazel_root = tao_bazel_dir(root)
-        with cwd(tao_bazel_root), gcc_env(args.bridge_gcc):
-            if cpp:
-                output_file = os.path.join(tao_bazel_root, "cpp_test.out")
-                execute(f"bazel test {tao_bridge_bazel_config(args)} //...")
-                logger.info("Stage [test_tao_bridge_cpp] with bazel success, output: " + output_file)
-            if python:
-                output_file = os.path.join(tao_bazel_root, "py_test.out")
-                py_bin = os.path.join(args.venv_dir, "bin", PYTHON_BIN_NAME)
-                test_root_disc = "{}/tao/tao_bridge/test/gpu".format(root)
-                test_root_cpu = "{}/platform_alibaba/tao_bridge/test/cpu".format(internal_root_dir())
-                test_root_gpu = "{}/platform_alibaba/tao_bridge/test/gpu".format(internal_root_dir())
-
-                if args.platform_alibaba:
-                    if args.cpu_only:
-                        run_py_test(py_bin, test_root_cpu, output_file, ["test_*.py"],
-                            ["PLATFORM_ALIBABA=ON"])
-                    else:
-                        run_py_test(py_bin, test_root_gpu, output_file, ["test_*.py"],
-                            ["PLATFORM_ALIBABA=ON"])
-                        run_py_test(py_bin, test_root_disc, output_file, ["test_mlir*.py"],
-                            ["PLATFORM_ALIBABA=ON"])
-                else:
-                    if not args.cpu_only:
-                        run_py_test(py_bin, test_root_disc, output_file, ["test_mlir*.py"])
-
-                logger.info("Stage [test_tao_bridge_py] success, output: " + output_file)
+            logger.info("Stage [test_tao_bridge_py] success, output: " + output_file)
 
 
 def prepare_env(args):
@@ -737,6 +548,9 @@ def prepare_env(args):
     if args.dcu:
         os.environ["TF_DEVICE"] = "dcu"
         logger.info("[BUILD] build for DCU ...")
+    elif args.rocm:
+        os.environ["TF_DEVICE"] = "rocm"
+        logger.info("[BUILD] build for ROCM ...")
     elif not args.cpu_only:
         os.environ["TF_DEVICE"] = "gpu"
         os.environ["TF_GPU_VERSION"] = get_tf_gpu_version()
@@ -820,7 +634,7 @@ def make_package(root, args):
         generate_build_info(build_info_file)
 
         F_TAO_COMPILER_MAIN = (
-            "./tf_community/bazel-bin/tensorflow/compiler/decoupling/tao_compiler_main"
+            "./tao_compiler/bazel-bin/decoupling/tao_compiler_main"
         )
         F_TAO_OPS_SO = "./tao/bazel-bin/libtao_ops.so"
         F_PTXAS = "./tao/third_party/ptxas/10.2/ptxas"
@@ -839,7 +653,21 @@ def make_package(root, args):
             add_to_tar(tar, build_info_file)
             if libstdcxx_path:
                 add_to_tar(tar, libstdcxx_path, name_in_tar=libstdcxx_name)
-        logger.info("sdk package created   : " + dsw_tgz)
+        logger.info("sdk package created : " + dsw_tgz)
+
+        # pkg for tf serving
+        serving_tgz = "{}/tao/tao_serving_sdk_{}.tgz".format(root, args.version)
+        tao_bazel_root = tao_bazel_dir(root)
+        with cwd(tao_bazel_root), gcc_env(args.bridge_gcc):
+            execute(f"bazel build {tao_bridge_bazel_config(args)} //:lib_tao_serving_genrule")
+        F_TAO_OPS_SERVING_SO = "./tao/bazel-bin/serving/libtao_ops.so"
+        with tarfile.open(serving_tgz, "w:gz") as tar:
+            add_to_tar(tar, F_TAO_COMPILER_MAIN)
+            add_to_tar(tar, F_TAO_OPS_SERVING_SO)
+            add_to_tar(tar, build_info_file)
+            if libstdcxx_path:
+                add_to_tar(tar, libstdcxx_path, name_in_tar=libstdcxx_name)
+        logger.info(f"sdk package for serving created : {serving_tgz}")
 
         logger.info("Stage [make_package] success.")
 
@@ -901,26 +729,24 @@ def parse_args():
         "build stages\nwill be triggered before test stages run.",
     )
     parser.add_argument(
+        "--rocm_toolkit_codegen", action="store_true", help="enable codegen using rocm native toolkit."
+    )
+    parser.add_argument(
         "-s",
         "--stage",
         required=False,
         choices=[
             "all",
             "configure",
-            "configure_pytorch",
             "lint",
             "build",
             "build_tao_compiler",
             "build_tao_bridge",
-            "build_dsw",
-            "build_mlir_ral",
             "test",
-            "test_bace",
             "test_tao_bridge_cpp",
             "test_tao_bridge_py",
             "test_tao_compiler",
             "package",
-            "package_ral",
         ],
         default="all",
         metavar="stage",
@@ -931,7 +757,6 @@ def parse_args():
     - build: parent stage of the following:
         - build_tao_compiler: build tao_compiler only.
         - build_tao_bridge: build tao_bridge only.
-        - build_dsw: build dsw .whl only.
     - test: test tao_compiler (not ready for now) and tao_bridge.
         - test_tao_bridge_cpp: run cpp unit tests for tao_bridge.
         - test_tao_bridge_py: run python unit tests for tao_bridge.
@@ -943,24 +768,6 @@ def parse_args():
         required=False,
         action="store_true",
         help="Skip linking tf framework",
-    )
-    parser.add_argument(
-        "--cpu_only",
-        required=False,
-        action="store_true",
-        help="Build tao with cpu support only",
-    )
-    parser.add_argument(
-        "--aarch64",
-        required=False,
-        action="store_true",
-        help="Build tao with aarch64 support only",
-    )
-    parser.add_argument(
-        "--dcu",
-        required=False,
-        action="store_true",
-        help="Build tao with dcu support only",
     )
     parser.add_argument(
         "--build_in_aone",
@@ -991,16 +798,7 @@ def parse_args():
         help="bazel build/test targets for tao compiler",
     )
     parser.add_argument(
-        "--cmake",
-        required=False,
-        action="store_true",
-        help="cmake build/test targets for tao bridge",
-    )
-    parser.add_argument(
         "--build_dbg_symbol", action="store_true", help="Add -g to build options"
-    )
-    parser.add_argument(
-        "--platform_alibaba", action="store_true", help="build with is_platform_alibaba=True"
     )
     parser.add_argument(
         "--blade_gemm", action="store_true", help="build with is_blade_gemm=True"
@@ -1011,6 +809,11 @@ def parse_args():
         default="/usr/local/cuda-11.6/bin/nvcc",
         help="Nvcc used for blade gemm kernel build.",
     )
+    parser.add_argument(
+        "--skip_compute_intensive_fusion", action="store_true", help="build compiler with --config=skip_compute_intensive_fusion"
+    )
+    add_arguments_common(parser)
+
     # flag validation
     args = parser.parse_args()
     assert args.venv_dir, "virtualenv directory should not be empty."
@@ -1022,8 +825,6 @@ def parse_args():
     if args.stage in ["all", "configure"]:
         assert args.bridge_gcc, "--bridge-gcc is required."
         assert args.compiler_gcc, "--compiler-gcc is required."
-    elif args.stage in ["configure_pytorch"]:
-        assert args.bridge_gcc, "--bridge-gcc is required."
     else:
         assert (
             args.bridge_gcc is None
@@ -1035,7 +836,7 @@ def parse_args():
     if args.version == "auto":
         args.version = open(get_version_file()).read().split()[0]
 
-    if args.platform_alibaba and (args.build_in_aone or args.blade_gemm):
+    if args.platform_alibaba and (args.build_in_aone or args.blade_gemm) and not (args.dcu or args.rocm):
         cuda_ver, _ = deduce_cuda_info()
         if float(cuda_ver) >= 11.0:
             args.blade_gemm = True
@@ -1067,14 +868,11 @@ def main():
         logger.info(os.environ["TF_BUILD_OPTS"])
         logger.info(os.environ["TF_TEST_OPTS"])
 
-    if stage in ["all", "configure", "configure_pytorch"]:
+    if stage in ["all", "configure"]:
         if args.enable_mkldnn:
             with gcc_env(args.bridge_gcc):
                 config_mkldnn(root, args)
-        if stage == "configure_pytorch":
-            configure_pytorch(root, args)
-        else:
-            configure(root, args)
+        configure(root, args)
 
     restore_gcc_conf(args)
     assert args.compiler_gcc in ["7.3", "7.5", "default"], "compiler_gcc {} not supported".format(
@@ -1084,18 +882,14 @@ def main():
     is_test = stage in ["test", "test_tao_bridge_cpp", "test_tao_bridge_py"]
 
     if (
-        stage in ["all", "build", "build_tao_compiler", "build_mlir_ral"]
+        stage in ["all", "build", "build_tao_compiler"]
         or is_test
         and not args.no_build_for_test
     ):
         if args.enable_mkldnn:
             with gcc_env(args.bridge_gcc):
                 build_mkldnn(root)
-        build_blade_gemm(root, args)
-        if stage == "build_mlir_ral":
-            build_mlir_ral(root, args)
-        else:
-            build_tao_compiler(root, args)
+        build_tao_compiler(root, args)
 
     if (
         stage in ["all", "build", "build_tao_bridge"]

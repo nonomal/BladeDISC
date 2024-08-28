@@ -54,7 +54,7 @@ def _prim_dict_construct(container_map, local, graph, node):
     local.add(node.output())
 
 def _prim_constant(container_map, local, graph, node):
-    if "Dict" in str(node.output().type()):
+    if str(node.output().type()).startswith("Dict"):
         dict_instance = node.output().toIValue()
         vals = dict_instance.values()
         vals = [graph.insertConstant(v) for v in vals]
@@ -62,7 +62,7 @@ def _prim_constant(container_map, local, graph, node):
             v.node().moveAfter(node)
         dc_inputs = dict(zip(dict_instance.keys(), vals))
         container_map[node.output()] = Container(instance=dc_inputs, static=True)
-    elif "List" in str(node.output().type()):
+    elif str(node.output().type()).startswith("List"):
         vals = [graph.insertConstant(v) for v in node.output().toIValue()]
         for v in reversed(vals):
             v.node().moveAfter(node)
@@ -249,7 +249,7 @@ def _aten_undefined(container_map, local, graph, node):
         # meet undefined use, stop static analysis
         container_map[inp] = Container(instance=container.instance, static=False)
 
-def _jit_pass_clean_python_ir(graph):
+def _jit_pass_clean_python_ir(graph, is_training=False):
     handler = {
         "prim::DictConstruct": _prim_dict_construct,
         "prim::ListConstruct": _prim_list_construct,
@@ -292,7 +292,9 @@ def _jit_pass_clean_python_ir(graph):
         torch._C._jit_pass_dce(graph)
         tools._jit_pass_lower_simple_tuples(graph)
         tools._jit_pass_const_loop_unrolling(graph)
-        torch._C._jit_pass_constant_propagation(graph)
+        if not is_training:
+            # training with dynamo 
+            torch._C._jit_pass_constant_propagation(graph)
 
         analysis_python_ir(graph)
     # eliminate dead codes create during analysis_python_ir

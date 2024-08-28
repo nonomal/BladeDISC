@@ -16,13 +16,13 @@ limitations under the License.
 #ifndef DISC_TRANSFORMS_PASSDETAIL_H_
 #define DISC_TRANSFORMS_PASSDETAIL_H_
 
-#include "mlir/Dialect/GPU/Passes.h"
+#include "mlir/Dialect/GPU/Transforms/Passes.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Pass/Pass.h"
-#include "tensorflow/compiler/mlir/disc/IR/disc_shape_ops.h"
+#include "mlir/disc/IR/disc_shape_ops.h"
 
 namespace mlir {
-class AffineDialect;
+
 namespace NVVM {
 class NVVMDialect;
 }
@@ -46,10 +46,34 @@ namespace shape {
 class ShapeDialect;
 }
 
+namespace mhlo {
+class MhloDialect;
+}
+
+namespace arith {
+class ArithDialect;
+}
+
+namespace linalg {
+class LinalgDialect;
+}
+
+namespace vector {
+class VectorDialect;
+}
+
+namespace tensor {
+class TensorDialect;
+}
+
+namespace affine {
+class AffineDialect;
+}
+
 namespace disc_ral {
 
 #define GEN_PASS_CLASSES
-#include "tensorflow/compiler/mlir/disc/transforms/disc_passes.h.inc"
+#include "mlir/disc/transforms/disc_passes.h.inc"
 
 }  // namespace disc_ral
 }  // namespace mlir
@@ -58,7 +82,7 @@ namespace mlir {
 namespace mhlo_disc {
 
 #define GEN_PASS_CLASSES
-#include "tensorflow/compiler/mlir/disc/transforms/mhlo_disc_passes.h.inc"
+#include "mlir/disc/transforms/mhlo_disc_passes.h.inc"
 
 }  // namespace mhlo_disc
 }  // namespace mlir

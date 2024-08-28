@@ -11,21 +11,9 @@
 # limitations under the License.
 set -ex
 
-[[ $# -eq 1 ]] || { echo "Usage: $0 <device>"; exit 1; }
-
-device=$1
-[[ -z "${device}" ]] && { echo "Device is required, but got '${device}'"; exit 1; }
-[[ ! "${device}" =~ ^cu[0-9]+ ]] && { echo "Skip installing TensorRT for non-CUDA image."; exit 0; }
-
-echo "Install TensorRT for: ${device}"
-
-if [[ ${device} == "cu102" ]]; then
-    tensorrt_pkg=TensorRT-8.0.1.6.Linux.x86_64-gnu.cuda-10.2.cudnn8.2.tar.gz
-else
-    tensorrt_pkg=TensorRT-8.0.1.6.Linux.x86_64-gnu.cuda-11.3.cudnn8.2.tar.gz
-fi
-curl -sL https://pai-blade.oss-cn-zhangjiakou.aliyuncs.com/tensorrt_versions/${tensorrt_pkg} -o ${tensorrt_pkg} 
+tensorrt_pkg=TensorRT-8.2.3.0.Linux.x86_64-gnu.cuda-11.4.cudnn8.2.tar.gz
+curl -sL https://pai-blade.oss-accelerate.aliyuncs.com/build_deps/tensorrt/${tensorrt_pkg} -o ${tensorrt_pkg}
 
 tar xvfz $tensorrt_pkg -C /usr/local/ 1>/dev/null 2>&1
-ln -s /usr/local/TensorRT-8.0.1.6 /usr/local/TensorRT
+ln -s /usr/local/${tensorrt_pkg%%.Linux*.tar.gz} /usr/local/TensorRT
 rm -rf $tensorrt_pkg

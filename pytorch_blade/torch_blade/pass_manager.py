@@ -10,15 +10,29 @@
 # limitations under the License.
 
 import torch
-from torch.onnx.symbolic_helper import _default_onnx_opset_version, _set_opset_version
-from torch.onnx import OperatorExportTypes
-from torch.onnx.symbolic_helper import _export_onnx_opset_version
-
 import torch_blade
-from torch_blade import utils
-from torch_blade import tools
-from torch_blade.config import Config, OptPipelines
+from torch.onnx import OperatorExportTypes
+from torch.onnx.symbolic_helper import _set_opset_version
+from torch_blade import tools, utils
+from torch_blade.config import Config
+from torch_blade.logging import logger
+from torch_blade.mlir import _DISC_NAME
 from torch_blade.python_ir_analysis import _jit_pass_clean_python_ir
+from torch_blade.quantization import (
+    _jit_pass_quantization_postprocess,
+    _jit_pass_quantization_preprocess
+)
+
+
+def _get_current_onnx_opset_version():
+    if utils.torch_version_number() < utils.parse_version("1.12.0"):
+        from torch.onnx.symbolic_helper import _export_onnx_opset_version
+    else:
+        from torch.onnx._globals import GLOBALS
+        _export_onnx_opset_version = GLOBALS.export_onnx_opset_version
+    return _export_onnx_opset_version
+
+
 # tools are some function borrowed from torch that is private,
 # which should be use carefully
 
@@ -52,13 +66,12 @@ def _set_opset_version_from_config():
     cfg = Config.get_current_context_or_new()
     if cfg.customize_onnx_opset_version:
         opset_version = cfg.customize_onnx_opset_version
-    else:
-        opset_version = _default_onnx_opset_version
-    _set_opset_version(opset_version)
-    return opset_version
+        _set_opset_version(opset_version)
+        return opset_version
+    return _get_current_onnx_opset_version()
 
 
-def _export_onnx(graph, dynamic_axes, fold_constants=False):
+def _export_onnx(graph, dynamic_axes, fold_constants=True):
     # Note: TRT7 support opset 11
     opset_version = _set_opset_version_from_config()
 
@@ -100,7 +113,7 @@ def _jit_pass_lower_to_onnx(graph):
     """ currently _jit_pass_lower_all_tuples will modified the graph output if it's tuple"""
     # NB(xiafei.qiuxf): Should set opset version here to be consistent with _export_onnx.
     _set_opset_version_from_config()
-
+    current_onnx_opset_version = _get_current_onnx_opset_version()
     # onnx does not support tuples, so try to remove them
     # torch._C._jit_pass_lower_all_tuples(graph)
     # torch._C._jit_pass_peephole(graph, True)
@@ -142,14 +155,13 @@ def _jit_pass_lower_to_onnx(graph):
     # lint the graph
     torch._C._jit_pass_lint(onnx_graph)
 
-    from torch.onnx.symbolic_helper import _export_onnx_opset_version
     if utils.torch_version_number() >= utils.parse_version("1.9.0"):
-        torch._C._jit_pass_onnx_scalar_type_analysis(onnx_graph, True, _export_onnx_opset_version)
+        torch._C._jit_pass_onnx_scalar_type_analysis(onnx_graph, True, current_onnx_opset_version)
     else:
         torch._C._jit_pass_onnx_scalar_type_analysis(onnx_graph)
     torch._C._jit_pass_lint(onnx_graph)
 
-    torch._C._jit_pass_onnx_peephole(onnx_graph, _export_onnx_opset_version, False)
+    torch._C._jit_pass_onnx_peephole(onnx_graph, current_onnx_opset_version, False)
     torch._C._jit_pass_lint(onnx_graph)
 
     # graph is not a valid jit graph anymore because types have been replaced
@@ -166,16 +178,17 @@ def _jit_pass_lower_to_onnx(graph):
 
 
 def _jit_pass_onnx_constfold(graph, params_dict):
-    if _export_onnx_opset_version in [9, 10, 11]:
+    current_onnx_opset_version = _get_current_onnx_opset_version()
+    if current_onnx_opset_version >= 9:
         params_dict = torch._C._jit_pass_onnx_constant_fold(
-            graph, params_dict, _export_onnx_opset_version
+            graph, params_dict, current_onnx_opset_version
         )
         torch._C._jit_pass_dce_allow_deleting_nodes_with_side_effects(graph)
     torch._C._jit_pass_lint(graph)
     return graph, params_dict
 
 
-def _jit_pass_freeze_rank(graph):
+def _jit_pass_freeze_rank(graph, is_training=False):
     def freeze_rank_analysis(outer_block):
         dim_nodes = [
             n
@@ -195,7 +208,8 @@ def _jit_pass_freeze_rank(graph):
 
     freeze_rank_analysis(graph)
     torch._C._jit_pass_dce(graph)
-    torch._C._jit_pass_constant_propagation(graph)
+    if not is_training:
+        torch._C._jit_pass_constant_propagation(graph)
 
 def _jit_pass_freeze_requires_grad(graph):
     # Note: this replace requires_grad to false,
@@ -296,56 +310,221 @@ def _jit_pass_clean_script(graph):
     torch._C._jit_pass_dce(graph)
 
 
-def _optimize_common(c_module, static_shape=False):
-    is_training = c_module.hasattr("training") and c_module.training
+def _erase_input_concrete_types(graph):
+    for idx, input in enumerate(graph.inputs()):
+        # skip the 1th self input value
+        is_tensor = input.type().isSubtypeOf(torch._C.TensorType.get())
+        if not is_tensor: continue
+        inp_typ = input.type()
+        dim = inp_typ.dim()
+        if isinstance(dim, int):
+            tools.set_tensor_shape(input, [-1] * dim)
+
+
+def _set_annotate_args(c_module, annotations):
+    graph = c_module.forward.graph
+    for idx, input in enumerate(graph.inputs()):
+        # skip the 1th self input value
+        if idx == 0:
+            continue
+        input_dims, _ = annotations[idx-1]
+        tools.set_tensor_shape(input, input_dims)
+
+
+def _fixup_for_dynamic_shape(cfg, c_module):
+    if cfg.enable_static_shape:
+        return
+
+    from torch_blade.mlir import _DISC_NAME
+    # shape annotations for DISC
+    if cfg.optimization_pipeline != _DISC_NAME:
+        return
+    if cfg.annotate_args:
+        _set_annotate_args(c_module, cfg.annotate_args)
+    else:
+        _erase_input_concrete_types(c_module.forward.graph)
+    torch_blade.jit_pass_propagate_input_shapes(c_module.forward.graph)
+
+
+def _optimize_common(c_module):
+    cfg = Config.get_current_context_or_new()
+    static_shape = cfg.enable_static_shape
+
+    is_training = c_module.hasattr("training") and c_module.training or cfg.disable_optimization_for_inference
+    if is_training and cfg.enable_int8:
+        logger.error("If do quantization, the model must in eval mode ")
+    if cfg.enable_int8:
+        _jit_pass_quantization_preprocess(c_module)
     if not is_training:
         # optimization passes only work in eval mode
-        cfg = Config.get_current_context_or_new()
-        presv_attrs = cfg.preserved_attributes
-        c_module = tools.freeze_module(c_module, presv_attrs, disableShapePeephole=not static_shape)
+        if cfg.freeze_module:
+            presv_attrs = cfg.preserved_attributes
+            c_module = tools.freeze_module(c_module, presv_attrs, disableShapePeephole=not static_shape)
         torch._C._jit_pass_remove_dropout(c_module)
+        _fixup_for_dynamic_shape(cfg, c_module)
         graph = c_module.forward.graph
         _jit_pass_remove_nograd(graph)
         _jit_pass_freeze_requires_grad(graph)
+        if hasattr(torch._C, "_jit_pass_fold_frozen_conv_bn"):
+            torch._C._jit_pass_fold_frozen_conv_bn(graph)
 
     graph = c_module.forward.graph
+    if cfg.optimization_pipeline == _DISC_NAME:
+        # The inplace op's output type has no promotion.
+        #
+        # Without this pass, the _jit_pass_remove_mutation
+        # pass will remove inplace ops. 
+        # The following pass will rename inplace op, such as:
+        #    aten::add_.Tensor -> aten::add_inplace_.Tensor
+        # With the overload name we have more information to
+        # recover the original op. Otherwise,
+        # we can't do the type promotion correctly.
+        _jit_pass_replace_inplace_name(graph)
     torch._C._jit_pass_remove_mutation(graph)
+    _jit_pass_reinplace(graph)
+
 
     # TODO: if dynamic rank exists, this pass maybe leads to error
     if IGNORE_DYNAMIC_RANK:
-        _jit_pass_freeze_rank(c_module.forward.graph)
-
+        _jit_pass_freeze_rank(c_module.forward.graph, is_training)
+        if not is_training:
+            torch._C._jit_pass_constant_propagation(graph)
     tools._jit_pass_lower_simple_tuples(c_module.forward.graph)
     _jit_pass_clean_script(c_module.forward.graph)
 
     # The _jit_pass_clean_python_ir was placed here,
     # because it needs some preprocess jit pass before,
     # such as remove grads ir nodes, freeze rank, tuple lowering etc.
-    _jit_pass_clean_python_ir(graph)
+    _jit_pass_clean_python_ir(graph, is_training)
+
+    if cfg.enable_int8:
+        _jit_pass_quantization_postprocess(c_module)
     return c_module
 
-def _jit_pass_licm(graph):
-    torch._C._jit_pass_remove_mutation(graph)
-    tools.licm(graph)
+def _jit_pass_replace_inplace_name(graph):
+    black_list_inplace_ops = ['add_.Tensor', 'sub_.Tensor', 'mul_.Tensor', 'div_.Tensor']
+    black_list_inplace_ops = set("aten::" + op for op in black_list_inplace_ops)
+    def _collect_all_inplace_nodes(block):
+        all_nodes = [node for node in block.nodes() if tools.node_overload_name(node) in black_list_inplace_ops]
+        for node in block.nodes():
+            for inner_blk in node.blocks():
+                all_nodes += _collect_all_inplace_nodes(inner_blk)
+        return all_nodes
 
-def _jit_pass_patine_conv2d(graph):
-    torch._C._jit_pass_custom_pattern_based_rewrite_graph("""
-graph(%input, %weight, %bias, %stride, %padding, %dilation, %group):
-   %r = aten::conv2d(%input, %weight, %bias, %stride, %padding, %dilation, %group)
-   %r = aten::relu(%r)
-   return (%r)""", """
-graph(%input, %weight, %bias, %stride, %padding, %dilation, %group):
-   %0 : int = prim::Constant[value=0]()
-   %1 : int = prim::Constant[value=1]()
-   %2 : int = prim::Constant[value=2]()
-   %3 : int = prim::Constant[value=3]()
-   %nhwc_dims : int[] = prim::ListConstruct(%0, %2, %3, %1)
-   %nhwc = aten::permute(%input, %nhwc_dims)
-   %r = patine::conv2d_relu_nhwc(%nhwc, %weight, %bias, %stride, %padding, %dilation, %group)
-   %nchw_dims : int[] = prim::ListConstruct(%0, %3, %1, %2)
-   %nchw = aten::permute(%r, %nchw_dims)
-   return (%nchw)""", graph)
-    tools.eliminate_redundant_permutations(graph)
+    def _replace_inplace_name(graph):
+        all_nodes = _collect_all_inplace_nodes(graph)
+        for idx, node in enumerate(all_nodes):
+            new_op = graph.create(node.kind() + "inplace_")
+            value = node.output()
+            for inp in node.inputs():
+                new_op.addInput(inp)
+            graph.appendNode(new_op)
+            new_op.moveBefore(node)
+            new_op.output().setType(node.output().type())
+            value.replaceAllUsesWith(new_op.output())
+            node.destroy()
+
+    _replace_inplace_name(graph)
+
+
+def _jit_pass_reinplace(graph):
+    """
+    before:
+    %slice = slice(%arg0, %start, %end, %step)
+    %slice.1 = slice(%slice, %start.1, %end.1, %step)
+    %output = add_(%slice.1, %arg1)
+
+    after:
+    %slice = slice(%arg0, %start, %end, %step)
+    %slice.1 = slice(%slice, %start.1, %end.1, %step)
+    %output = add(%slice.1, %arg1)
+
+    %slice.2 = slice(%arg0, %start, %end, %step)
+    %slice_scatter.1 = slice_scatter(%slice.2, %output, %start, %end, %step)
+    %slice_scatter.2 = slice_scatter(%slice_scatter.1, %output, %start.1, %end.1, %step)
+    %copy = copy_(%arg0, %slice_scatter.2, %false)
+    """
+    def _collect_all_inplace_nodes(block):
+        all_nodes = []
+        for node in block.nodes():
+            if "inplace" in node.kind():
+                inp_value = next(node.inputs())
+                if inp_value.node().kind() == "aten::slice":
+                    all_nodes.append(node)
+        for node in block.nodes():
+            for inner_blk in node.blocks():
+                all_nodes += _collect_all_inplace_nodes(inner_blk)
+        return all_nodes
+
+    inplace_nodes = _collect_all_inplace_nodes(graph)
+    cst_false = graph.create("prim::Constant")
+    cst_false.i_("value", 0)
+    cst_false.output().setType(torch._C.BoolType.get())
+    graph.appendNode(cst_false)
+    for node in inplace_nodes:
+        # create a outplace op
+        new_op = graph.create(node.kind().rstrip("_inplace_"))
+        value = node.output()
+        for inp in node.inputs():
+            new_op.addInput(inp)
+        graph.appendNode(new_op)
+        new_op.moveBefore(node)
+        new_op.output().setType(value.type())
+        value.replaceAllUsesWith(new_op.output())
+
+        # find the first slice op
+        slice_ops = []
+        prv_node = None
+        inp_v = next(node.inputs())
+        cur_node = inp_v.node()
+        first_slice = cur_node
+        while cur_node.kind() == "aten::slice":
+            slice_ops.append(cur_node)
+            first_slice = cur_node
+            cur_node = next(cur_node.inputs()).node()
+
+        # create aten::slice 
+        slice_0 = graph.create("aten::slice")
+        for inp in first_slice.inputs():
+            slice_0.addInput(inp)
+        slice_0.output().setType(first_slice.output().type())
+        graph.appendNode(slice_0)
+        slice_0.moveAfter(new_op)
+
+        # create aten::slice_scatter
+        inp1_v = slice_0.output()
+        inp2_v = new_op.output()
+        prev_node = slice_0
+        for op_idx, op in enumerate(slice_ops):
+            slice_scatter = graph.create("aten::slice_scatter")
+            input_list = [v for v in op.inputs()]
+            if op_idx == 0:
+                slice_scatter.addInput(slice_0.output())
+                slice_scatter.addInput(new_op.output())
+            else:
+                slice_scatter.addInput(input_list[0])
+                slice_scatter.addInput(prev_node.output())
+            for idx, inp in enumerate(op.inputs()):
+                if idx < 1:
+                    continue
+                slice_scatter.addInput(inp)
+            slice_scatter.output().setType(next(slice_scatter.inputs()).type())
+            out = slice_scatter.output()
+            graph.appendNode(slice_scatter)
+            slice_scatter.moveAfter(prev_node)
+            prev_node = slice_scatter
+         
+        # create aten::copy_
+        copy_op = graph.create("aten::copy_")
+        copy_op.addInput(list(slice_scatter.inputs())[0])
+        copy_op.addInput(slice_scatter.output())
+        copy_op.addInput(cst_false.output())
+        copy_op.output().setType(list(slice_scatter.inputs())[0].type())
+        graph.appendNode(copy_op)
+        if list(graph.return_node().inputs())[0].node().kind() == "prim::TupleConstruct":
+            copy_op.moveBefore(list(graph.return_node().inputs())[0].node())
+        list(copy_op.inputs())[0].replaceAllUsesAfterNodeWith(copy_op, slice_scatter.output())
+        node.destroy()
 
 def _jit_pass_hack_cpu_device(graph):
     cfg = Config.get_current_context_or_new()
@@ -358,6 +537,16 @@ def _jit_pass_hack_cpu_device(graph):
         if prim_const.hasAttribute('value') and prim_const.kindOf('value') == 's' and prim_const.s('value') == 'cpu':
             prim_const.s_('value', 'cuda')
 
+def _jit_pass_hack_gpu_device(graph):
+    cfg = Config.get_current_context_or_new()
+    if not cfg.force_gpu_constants_to_device:
+        return
 
-OptPipelines.register_pipeline("LICM", _jit_pass_licm)
-OptPipelines.register_pipeline("PATINE_CONV2D", _jit_pass_patine_conv2d)
+    torch._C._jit_pass_inline(graph)
+    nodes = [n for n in graph.nodes() if 'prim::Constant' in n.kind()]
+    for prim_const in nodes:
+        if prim_const.hasAttribute('value') and prim_const.kindOf('value') == 's':
+            val = prim_const.s('value')
+            if val == 'cuda' or val.startswith('cuda:'):
+                prim_const.s_('value', cfg.force_gpu_constants_to_device)
+

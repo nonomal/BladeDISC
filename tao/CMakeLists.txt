@@ -15,6 +15,10 @@ if(${TAO_CUDA})
   include(CMake/SetupCUDA.cmake)
 endif()
 
+if(${TAO_ROCM})
+  include(CMake/SetupROCM.cmake)
+endif()
+
 if(EXISTS ${PROJECT_BINARY_DIR}/config.cmake)
     include(${PROJECT_BINARY_DIR}/config.cmake)
 endif()
@@ -23,16 +27,15 @@ endif()
 tao_option(TAO_ENABLE_WARMUP_XFLOW "Build xflow for warming up or not." OFF)
 tao_option(TAO_DISABLE_LOWER_IF_WHILE "If disable lowering if & while." OFF)
 tao_option(TAO_ENABLE_CXX_TESTING "If ON, TAO tests will be built and run." OFF)
-tao_option(TAO_ENABLE_TVM "if ON, tvm backend is enabled" OFF)
 tao_option(TAO_ENABLE_UPLOAD_TOOL "if ON, enable uploading tool building" OFF)
 tao_option(TAO_DISABLE_LINK_TF_FRAMEWORK "if disable, do not link tf framework" OFF)
 tao_option(TAO_ENABLE_AUTH "if ON, linking the authentication library" OFF)
 tao_option(PLATFORM_ALIBABA "if ON, building with internal library" OFF)
-tao_option(TAO_ENABLE_PATINE "if ON, using patine for compute-intensive ops" OFF)
 tao_option(ENABLE_BLADE_GEMM "if ON, using blade_gemm for gpu dot-general" OFF)
 tao_option(TAO_ENABLE_MKLDNN "if ON, using mkldnn for compute-intensive ops" OFF)
 set(MKL_ROOT "third_party/mkldnn/build/intel" CACHE STRING "Set to mkl_root if enable MKL")
 tao_option(GTEST_TAR_URL "download cmake tarball via URL" "https://github.com/google/googletest/archive/refs/tags/release-1.11.0.tar.gz")
+tao_option(ROCM_PATH "Path to the ROCM toolchain" /opt/rocm)
 
 ############## config start ##############
 if (NOT UNIX)
@@ -134,6 +137,13 @@ endif()
 if(${TAO_DCU})
     list(APPEND TAO_OPS_DEFINITIONS "-DTENSORFLOW_USE_DCU")
     message(STATUS "Define preprocess macro: -DTENSORFLOW_USE_DCU")
+    list(APPEND TAO_OPS_DEFINITIONS "-DTENSORFLOW_USE_ROCM")
+    message(STATUS "Define preprocess macro: -DTENSORFLOW_USE_ROCM")
+endif()
+
+if(${TAO_ROCM})
+  list(APPEND TAO_OPS_DEFINITIONS "-DTENSORFLOW_USE_ROCM")
+  message(STATUS "Define preprocess macro: -DTENSORFLOW_USE_ROCM")
 endif()
 
 message(STATUS "TAO_OPS_DEFINITIONS:")
@@ -170,10 +180,6 @@ endif()
 
 if(${TAO_ENABLE_UPLOAD_TOOL} AND ${PLATFORM_ALIBABA})
   add_compile_options(-DTAO_ENABLE_UPLOAD_TOOL)
-endif()
-
-if(${TAO_ENABLE_PATINE})
-  add_compile_options(-DTAO_ENABLE_PATINE)
 endif()
 
 if(${ENABLE_BLADE_GEMM})
@@ -222,14 +228,6 @@ endif()
 
 ############### libtao_ops.so ###############
 
-if(${TAO_CUDA} AND ${PLATFORM_ALIBABA})
-  message("including  BACE")
-  include_directories(../../bace)
-  add_subdirectory(../../bace bace_src)
-  include_directories(../../guard_client)
-endif()
-
-
 set(OBJS
     $<TARGET_OBJECTS:tao_bridge>
     $<TARGET_OBJECTS:tf_port>
@@ -242,11 +240,6 @@ set(OBJS
 
 if(NOT ${TAO_CPU_ONLY} AND ${PLATFORM_ALIBABA})
   list(APPEND OBJS $<TARGET_OBJECTS:gpu>)
-endif()
-
-if(${TAO_ENABLE_TVM} AND ${PLATFORM_ALIBABA})
-  list(APPEND OBJS $<TARGET_OBJECTS:tvm_backend>)
-  add_definitions("-DUSE_TVM_CPU")
 endif()
 
 if(${PLATFORM_ALIBABA})
@@ -275,9 +268,6 @@ endif()
 
 add_subdirectory(tao_bridge)
 
-if(${TAO_ENABLE_PATINE})
-  add_subdirectory(${PLATFORM_ALIBABA_DIR}/third_party/PatineClient PatineClient)
-endif()
 if(${ENABLE_BLADE_GEMM})
   add_subdirectory(${PLATFORM_ALIBABA_DIR}/blade_gemm blade_gemm EXCLUDE_FROM_ALL)
 endif()
@@ -291,9 +281,6 @@ unset(CMAKE_PDB_OUTPUT_DIRECTORY CACHE)
 unset(CMAKE_RUNTIME_OUTPUT_DIRECTORY CACHE)
 if(${TAO_CPU_ONLY})
   target_link_libraries(tao_ops gomp)
-endif()
-if(${TAO_ENABLE_PATINE})
-  target_link_libraries(tao_ops patine_client)
 endif()
 if(${ENABLE_BLADE_GEMM})
   target_link_libraries(tao_ops blade_gemm)

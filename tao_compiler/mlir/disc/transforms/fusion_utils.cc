@@ -13,23 +13,27 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "tensorflow/compiler/mlir/disc/transforms/fusion_utils.h"
+#include "mlir/disc/transforms/fusion_utils.h"
 
 #include <algorithm>
 #include <mutex>
 
-#include "mlir-hlo/Dialect/lhlo/transforms/map_lmhlo_to_scalar_op.h"
-#include "mlir-hlo/utils/placement_utils.h"
-#include "mlir/Dialect/SCF/SCF.h"
+#include "lhlo/transforms/map_lmhlo_to_scalar_op.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Shape/IR/Shape.h"  // TF:llvm-project
-#include "mlir/IR/BlockAndValueMapping.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/MLIRContext.h"  // TF:llvm-project
 #include "mlir/IR/Matchers.h"
 #include "mlir/Interfaces/ViewLikeInterface.h"
-#include "tensorflow/compiler/mlir/disc/disc_util.h"
-#include "tensorflow/compiler/mlir/disc/transforms/codegen_utils.h"
-#include "tensorflow/compiler/mlir/disc/transforms/lhlo_elemental_utils.h"
-#include "tensorflow/compiler/mlir/disc/transforms/placement_utils.h"
+#include "mlir/disc/IR/lhlo_disc_ops.h"
+#include "mlir/disc/disc_util.h"
+#include "mlir/disc/transforms/codegen_utils.h"
+#include "mlir/disc/transforms/disc_shape_optimization_utils.h"
+#include "mlir/disc/transforms/lhlo_elemental_utils.h"
+#include "mlir/disc/transforms/placement_utils.h"
+#include "tensorflow/tsl/platform/str_util.h"
+#include "utils/placement_utils.h"
 
 // This file implements some helper functions and classes used to do fusion
 // & code generation.
@@ -38,13 +42,44 @@ namespace mlir {
 namespace disc_ral {
 
 using namespace lmhlo;
+using disc_shape::SymbolicDimOp;
 using placement_utils::kDiscPlaceAssignment;
 using placement_utils::kDiscShapeCalcAttr;
 
 void dumpFusionPattern(FusionPattern& pattern) {
+  llvm::dbgs() << "FusionType: " << pattern.getFusionTypeStr() << "\n";
   for (Operation* subOp : pattern.getOpList()) {
     llvm::dbgs() << "  " << *subOp << "\n";
   }
+}
+
+bool envValueIsTrue(const std::string& envName) {
+  static const char* env = getenv(envName.c_str());
+  if (!env) return false;
+  std::string envStr = env;
+  std::transform(envStr.begin(), envStr.end(), envStr.begin(),
+                 [](unsigned char c) { return std::tolower(c); });
+  return envStr == "true" || envStr == "1" || envStr == "on";
+}
+
+bool enableEagerTransposeFusion() {
+  return envValueIsTrue("DISC_CPU_ENABLE_EAGER_TRANSPOSE_FUSION");
+}
+
+bool enableTransposeLibraryCall() {
+  return envValueIsTrue("DISC_GPU_ENABLE_TRANSPOSE_LIBRARY_CALL");
+}
+
+bool isInplaceOperator(Operation* op) {
+  if (isa<lmhlo::LmhloOp>(op) && !isa<lmhlo::TerminatorOp>(op)) {
+    Value resultMemref = cast<lmhlo::LmhloOp>(op).getResultBuffer();
+    for (int i = 0; i < op->getNumOperands() - 1; ++i) {
+      if (op->getOperand(i) == resultMemref) {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 DenseSet<Operation*> NoLoaderUser(SmallVectorImpl<Operation*>& ops) {
@@ -53,8 +88,9 @@ DenseSet<Operation*> NoLoaderUser(SmallVectorImpl<Operation*>& ops) {
   for (Operation* op : ops) {
     Value memref = cast<lmhlo::LmhloOp>(op).getResultBuffer();
     if (memref == nullptr) continue;
+
     for (Operation* user : getValueUsersInFusionLike(memref, op)) {
-      if (isa<memref::LoadOp>(user)) {
+      if (isa<memref::LoadOp>(user) && !isInplaceOperator(op)) {
         worklist.push_back(op);
         has_loader_ops.insert(op);
       }
@@ -70,7 +106,8 @@ DenseSet<Operation*> NoLoaderUser(SmallVectorImpl<Operation*>& ops) {
         if ((!isa<lmhlo::LmhloOp>(user)) || has_loader_ops.count(user))
           continue;
         if (isSameUnderlineBuffer(cast<lmhlo::LmhloOp>(user).getResultBuffer(),
-                                  memref)) {
+                                  memref) &&
+            !isInplaceOperator(user)) {
           worklist.push_back(user);
           has_loader_ops.insert(user);
         }
@@ -84,15 +121,22 @@ DenseSet<Operation*> NoLoaderUser(SmallVectorImpl<Operation*>& ops) {
   return no_loader_ops;
 }
 
-void cleanUnusedLhloOps(Block* parent) {
+void cleanUnusedLhloOps(Block* parent, PatternRewriter* rewriter) {
   SmallVector<Operation*, 4> lhlo_ops;
   for (Operation& op : parent->getOperations()) {
-    if (op.getDialect() == op.getContext()->getLoadedDialect("lmhlo") &&
+    if ((op.getDialect() == op.getContext()->getLoadedDialect("lmhlo") ||
+         op.getDialect() == op.getContext()->getLoadedDialect("lmhlo_disc")) &&
         (!isa<lmhlo::TerminatorOp>(op)))
       lhlo_ops.push_back(&op);
   }
   const DenseSet<Operation*>& no_loader_user = NoLoaderUser(lhlo_ops);
-  for (auto* lhlo_op : no_loader_user) lhlo_op->erase();
+  for (auto* lhlo_op : no_loader_user) {
+    if (rewriter) {
+      rewriter->eraseOp(lhlo_op);
+    } else {
+      lhlo_op->erase();
+    }
+  }
 }
 
 // returns the users of the `memref`. The users should be in the same fusion
@@ -121,27 +165,6 @@ DenseSet<Operation*> getValueUsersInFusionLike(Value memref, Operation* op) {
   return ops;
 }
 
-bool isOnGpu(Operation* op) {
-  auto attr =
-      op->getAttrOfType<StringAttr>(placement_utils::kDiscPlaceAssignment);
-  if (attr) {
-    return (attr.getValue() == placement_utils::kGpu);
-  }
-
-  // Fusion should have been set a placement attribute in lhlo_fusion pass.
-  // Leave a default placement here just in case there are fusion ops not
-  // generated by the fusion pass (e.g. in the file-check based ut).
-  if (isa<lmhlo::FusionOp>(op)) return true;
-
-  assert(isa<lmhlo::LmhloOp>(op) && "Unexpected usage of isOnGpu");
-  auto result_memref = cast<lmhlo::LmhloOp>(op).getResultBuffer();
-  auto memory_space =
-      result_memref.getType().cast<MemRefType>().getMemorySpace();
-  return memory_space && memory_space.isa<StringAttr>() &&
-         memory_space.cast<StringAttr>().getValue() ==
-             mhlo::placement_utils::c_gpu;
-}
-
 StringRef fusionTypeToString(FusionType ft) {
   switch (ft) {
     case FusionType::kNone:
@@ -158,6 +181,14 @@ StringRef fusionTypeToString(FusionType ft) {
       return "kStitch";
     case FusionType::kLargeConcat:
       return "kLargeConcat";
+    case FusionType::kDot:
+      return "kDot";
+    case FusionType::kWhere:
+      return "kWhere";
+    case FusionType::kTransform:
+      return "kTransform";
+    case FusionType::kSparseReduction:
+      return "kSparseReduction";
     default:
       assert(false && "unknown fusion type");
       return "";
@@ -180,7 +211,16 @@ FusionType fusionTypeFromString(StringRef ft) {
     return FusionType::kStitch;
   } else if (ft == "kLargeConcat") {
     return FusionType::kLargeConcat;
+  } else if (ft == "kDot") {
+    return FusionType::kDot;
+  } else if (ft == "kWhere") {
+    return FusionType::kWhere;
+  } else if (ft == "kTransform") {
+    return FusionType::kTransform;
+  } else if (ft == "kSparseReduction") {
+    return FusionType::kSparseReduction;
   }
+
   assert(false && "unknown fusion type");
   return FusionType::kNone;
 }
@@ -215,9 +255,36 @@ void addFusionTag(OpBuilder& b, lmhlo::FusionOp op, StringRef tag) {
   std::string oldTag;
   auto attr = op->getAttrOfType<StringAttr>(kFusionOpTagAttr);
   if (attr && attr.getValue().size()) {
-    oldTag = (Twine(attr.getValue()) + "X").str();
+    oldTag = (Twine(attr.getValue()) + kFusionTagSeparator).str();
   }
   op->setAttr(kFusionOpTagAttr, b.getStringAttr((Twine(oldTag) + tag).str()));
+}
+
+void mergeFusionTag(OpBuilder& b, lmhlo::FusionOp op,
+                    const std::set<std::string>& tagSet) {
+  auto opTagSet = parsefusionTagSetFromStr(getFusionTagStr(op));
+  for (const auto& tag : tagSet) opTagSet.insert(tag);
+  auto newTagStr = llvm::join(opTagSet, kFusionTagSeparator);
+  op->setAttr(kFusionOpTagAttr, b.getStringAttr(newTagStr));
+}
+
+StringRef getFusionTagStr(lmhlo::FusionOp op) {
+  auto attr = op->getAttrOfType<StringAttr>(kFusionOpTagAttr);
+  return attr ? attr.getValue() : "";
+}
+
+std::string fusionTagSetToStr(const std::set<std::string>& tagSet) {
+  SmallVector<StringRef> tags;
+  for (const auto& tag : tagSet) tags.push_back(tag);
+  return llvm::join(tags, kFusionTagSeparator);
+}
+
+std::set<std::string> parsefusionTagSetFromStr(StringRef tagStr) {
+  SmallVector<StringRef> tags;
+  std::set<std::string> tagSet;
+  tagStr.split(tags, kFusionTagSeparator, /*MaxSplit*/ -1, /*KeepEmpty*/ false);
+  for (auto tag : tags) tagSet.insert(tag.str());
+  return tagSet;
 }
 
 // Returns the full name of the fusion op
@@ -240,6 +307,34 @@ std::string generateSignatureForFusion(FusionPattern& fusionPattern) {
   for (Operation* op : fusionPattern.getRootOps()) {
     sig.append(op->getName().stripDialect());
     sig.push_back('_');
+  }
+
+  if (fusionPattern.isTransformBasedFusion()) {
+    if (auto dotOp = dyn_cast_or_null<lmhlo::DotGeneralOp>(
+            fusionPattern.getDominantOp())) {
+      auto lhsTy = dotOp->getOperand(0).getType().cast<MemRefType>();
+      auto rhsTy = dotOp->getOperand(1).getType().cast<MemRefType>();
+      auto appendShapeToStr = [&](ArrayRef<int64_t> shape) {
+        for (const auto& en : llvm::enumerate(shape)) {
+          if (en.index() > 0) sig.append("x");
+          if (en.value() == ShapedType::kDynamic) {
+            sig.append("u");
+          } else {
+            sig.append(Twine(en.value()).str());
+          }
+        }
+      };
+      sig.append("_LS_");
+      appendShapeToStr(lhsTy.getShape());
+      sig.append("_RS_");
+      appendShapeToStr(rhsTy.getShape());
+      auto dimNumbers = dotOp.getDotDimensionNumbers();
+      sig.append("_LC_");
+      appendShapeToStr(dimNumbers.getLhsContractingDimensions());
+      sig.append("_RC_");
+      appendShapeToStr(dimNumbers.getRhsContractingDimensions());
+      sig.append("_");
+    }
   }
 
   sig.append(
@@ -270,17 +365,28 @@ bool inSameFusionFamily(Operation* op, Operation* other) {
   return ((opFusionName == otherFusionName) && !opFusionName.empty());
 }
 
+bool isSingleElementH2DOp(Operation* op) {
+  auto h2d_op = dyn_cast<lmhlo_disc::H2DOp>(op);
+  if (!h2d_op) return false;
+  return op->getOperand(0).getType().cast<MemRefType>().getNumElements() == 1;
+}
+
 // Returns true if the op is an elementwise unary lmhlo op.
 // TODO(disc): use fusibility interface
 // TODO(disc): Unify with disc_supported_list.h and Elementwise Trait
 bool isElementWiseUnary(Operation* op) {
+  // scalar h2d op can be fused and promoted to as operands of the kernel.
+  if (isa<lmhlo_disc::H2DOp>(op)) {
+    return isSingleElementH2DOp(op);
+  }
+
   // clang-format off
   return isa<
     lmhlo::AbsOp,
     lmhlo::CeilOp,
     lmhlo::ConvertOp,
     lmhlo::CopyOp,
-    lmhlo::CosOp,
+    lmhlo::CosineOp,
     lmhlo::ExpOp,
     lmhlo::FloorOp,
     lmhlo::IsFiniteOp,
@@ -291,8 +397,11 @@ bool isElementWiseUnary(Operation* op) {
     lmhlo::NotOp,
     lmhlo::RsqrtOp,
     lmhlo::SignOp,
+    lmhlo::SineOp,
     lmhlo::SqrtOp,
-    lmhlo::TanhOp
+    lmhlo::TanhOp,
+    lmhlo::RoundOp,
+    lmhlo::RoundNearestEvenOp
   >(op);
   // clang-format on
 }
@@ -312,24 +421,43 @@ bool isElementWiseBinary(Operation* op) {
     lmhlo::OrOp,
     lmhlo::PowOp,
     lmhlo::RemOp,
-    lmhlo::SubOp
+    lmhlo::SubtractOp
   >(op);
   // clang-format on
+}
+
+// Returns true if the op is an elementwise ternary lmhlo op.
+bool isElementWiseTernary(Operation* op) {
+  // Some ternary lmhlo ops (e.g. select op) suppport a restricted implicit
+  // broadcast semantic, that is: if one input has rank zero, then it will be
+  // automatically broadcasted if necessary. Thus we can know that there is no
+  // broadcast if all operands have the same rank.
+  if (isa<lmhlo::SelectOp, lmhlo::ClampOp>(op)) {
+    auto ref = op->getOperand(0).getType().cast<MemRefType>();
+    for (Value v : op->getOperands().drop_front())
+      if (v.getType().cast<MemRefType>().getRank() != ref.getRank())
+        return false;
+    return true;
+  }
+
+  return false;
 }
 
 // Returns true if the op is an elementwise lmhlo op.
 // TODO(disc): use fusibility interface
 bool isElementWise(Operation* op) {
-  return isElementWiseUnary(op) || isElementWiseBinary(op);
+  return isElementWiseUnary(op) || isElementWiseBinary(op) ||
+         isElementWiseTernary(op);
 }
 
 // Returns true if this op is a rank-2 row reduction.
 bool isRank2RowReduction(Operation* op) {
   auto reduce_op = dyn_cast<lmhlo::ReduceOp>(op);
-  if (!reduce_op || reduce_op.dimensions().getNumElements() != 1) return false;
+  if (!reduce_op || reduce_op.getDimensions().getNumElements() != 1)
+    return false;
 
   int rank = op->getOperand(0).getType().cast<MemRefType>().getRank();
-  auto dimensions = reduce_op.dimensions().getValues<int64_t>();
+  auto dimensions = reduce_op.getDimensions().getValues<int64_t>();
   return ((*dimensions.begin() == 1) && (rank == 2));
 }
 
@@ -338,7 +466,7 @@ bool isRowReduction(Operation* op) {
   auto reduce_op = dyn_cast<lmhlo::ReduceOp>(op);
   if (!reduce_op) return false;
 
-  auto dimensions = reduce_op.dimensions().getValues<int64_t>();
+  auto dimensions = reduce_op.getDimensions().getValues<int64_t>();
   auto ty = op->getOperand(0).getType().dyn_cast<MemRefType>();
   if (!ty) return false;
   int expected = ty.getRank() - 1;
@@ -354,25 +482,39 @@ bool isRowReduction(Operation* op) {
 // Returns true if this op is a rank-2 column reduction.
 bool isRank2ColReduction(Operation* op) {
   auto reduce_op = dyn_cast<lmhlo::ReduceOp>(op);
-  if (!reduce_op || reduce_op.dimensions().getNumElements() != 1) return false;
+  if (!reduce_op || reduce_op.getDimensions().getNumElements() != 1)
+    return false;
 
   int rank = op->getOperand(0).getType().cast<MemRefType>().getRank();
-  auto dimensions = reduce_op.dimensions().getValues<int64_t>();
+  auto dimensions = reduce_op.getDimensions().getValues<int64_t>();
   return ((*dimensions.begin() == 0) && (rank == 2));
+}
+
+// Return true if this op is a rank-2 transpose
+bool isRank2or3Transpose(Operation* op) {
+  auto transpose_op = dyn_cast<lmhlo::TransposeOp>(op);
+  if (!transpose_op) return false;
+
+  int rank = op->getOperand(0).getType().cast<MemRefType>().getRank();
+  return rank == 2 || rank == 3;
 }
 
 // Returns true if the op is supported by the downstreaming fusion codegen
 // engine.
 bool isFusible(Operation* op) {
   // Only scalar const are supported by the fusion codegen engine a.t.m.
-  if (isa<lmhlo::ConstOp>(op)) {
-    auto constant = cast<lmhlo::ConstOp>(op);
-    MemRefType type = constant.output().getType().cast<MemRefType>();
-    return (type.getRank() == 0 || constant.value().isSplat());
+  if (isa<lmhlo::ConstantOp>(op)) {
+    auto constant = cast<lmhlo::ConstantOp>(op);
+    MemRefType type = constant.getOutput().getType().cast<MemRefType>();
+    return (type.getRank() == 0 || constant.getValue().isSplat());
   }
 
   // All element ops are supported by the fusion codegen engine.
   if (isElementWise(op)) return true;
+
+  // lmhlo_disc.where is supported for fusion, fuse input element-wise ops like
+  // kInput fusion.
+  if (isa<lmhlo_disc::WhereOp>(op)) return true;
 
   // clang-format off
   return isa<
@@ -392,52 +534,50 @@ bool isFusible(Operation* op) {
     lmhlo::ReverseOp,
     lmhlo::SelectOp,
     lmhlo::SliceOp,
-    lmhlo::TransposeOp
+    lmhlo::TransposeOp,
+    lmhlo::DynamicUpdateSliceOp
   >(op);
   // clang-format on
 }
 
-// Returns the number of operands that are supposed to be written.
-// For some ops (e.g. lmhlo ops), some operands are the output memrefs
-// Thus these operands are supposed to be updated.
-int getNumResultOperands(Operation* op) {
-  if (op->getDialect()->getTypeID() != TypeID::get<lmhlo::LmhloDialect>()) {
-    return 0;
-  }
-  return llvm::count_if(op->getOperands(),
-                        [&](Value v) { return IsOpWriteValue(op, v); });
+bool isSparseFusion(FusionPattern& pattern) {
+  return pattern.getFusionType() == FusionType::kWhere ||
+         pattern.getFusionType() == FusionType::kSparseReduction;
 }
 
-// Returns data users of the value and its aliases (e.g. memref.cast).
-// Here non-data users means DimOp, DeallocOp and ShapeOfOp.
-SmallVector<Operation*, 4> getValueUsers(Value v) {
-  Value root = v;
-  while (Operation* operandOp = root.getDefiningOp()) {
-    auto view = dyn_cast<ViewLikeOpInterface>(operandOp);
-    if (!view) break;
-    root = operandOp->getOperand(0);
-  }
-
-  SmallVector<Operation*, 4> users;
-  SmallVector<Value, 4> worklist;
-  worklist.push_back(root);
-  while (!worklist.empty()) {
-    Value curr = worklist.back();
-    worklist.pop_back();
-    for (Operation* user : curr.getUsers()) {
-      // Skip non-data users
-      if (isa<memref::DimOp, memref::DeallocOp, shape::ShapeOfOp>(user)) {
-        continue;
+bool initFusionPatternBase(ShapeAnalysis& shapeAnalysis,
+                           FusionPattern& fusion_pattern) {
+  Operation* inferredDominantOp = nullptr;
+  FusionType inferredFusionType = FusionType::kNone;
+  for (Operation* op : fusion_pattern.getOpList()) {
+    if (isRank2RowReduction(op)) {
+      inferredFusionType = FusionType::kRowReduction;
+      inferredDominantOp = op;
+    } else if (isRank2ColReduction(op)) {
+      if (inferredFusionType != FusionType::kRowReduction) {
+        inferredFusionType = FusionType::kColReduction;
+        inferredDominantOp = op;
       }
-      // alias value
-      if (auto view = dyn_cast<ViewLikeOpInterface>(user)) {
-        worklist.push_back(view->getResult(0));
-      } else {
-        users.push_back(user);
+    } else if (isFusible(op)) {
+      // Ignore if already a kRowReduction or kColReduction, otherwise update
+      // the fusion type to kLoop and dominant op to current op. This supposes
+      // that the last op inside the block is a valid candidate dominant op if
+      // the fusion pattern is a kLoop.
+      if (inferredFusionType == FusionType::kNone ||
+          inferredFusionType == FusionType::kLoop) {
+        inferredFusionType = FusionType::kLoop;
+        inferredDominantOp = op;
       }
+    } else if (!isa<lmhlo::TerminatorOp>(op)) {
+      // Not a supported fusionOp, early stop.
+      inferredFusionType = FusionType::kNone;
+      inferredDominantOp = nullptr;
+      break;
     }
   }
-  return users;
+  fusion_pattern.setDominantOp(inferredDominantOp);
+  fusion_pattern.setFusionType(inferredFusionType);
+  return (inferredFusionType != FusionType::kNone && inferredDominantOp);
 }
 
 int64_t getFirstOperandIndex(Operation* op, Value value) {
@@ -455,12 +595,7 @@ int64_t getFirstOperandIndex(Operation* op, Value value) {
 FusionStrategy& getFusionStrategy(StringRef device, StringRef strategy);
 
 bool isStitchFusion(Operation* op) {
-  FusionType fusionType = FusionType::kNone;
-  auto fusionTypeAttr = op->getAttrOfType<StringAttr>(kDiscFusionTypeAttrName);
-  if (fusionTypeAttr) {
-    fusionType = fusionTypeFromString(fusionTypeAttr.getValue());
-  }
-  return fusionType == FusionType::kStitch;
+  return isFusionType<FusionType::kStitch>(op);
 }
 
 // Create a new fusion pattern from a single op.
@@ -471,7 +606,7 @@ FusionPatternBase::FusionPatternBase(Operation* op) {
 
 // Create a new fusion pattern from the ops inside the lmhlo fusion op.
 FusionPatternBase::FusionPatternBase(lmhlo::FusionOp op) {
-  for (Operation& op : op.region().getBlocks().front()) {
+  for (Operation& op : op.getRegion().getBlocks().front()) {
     if (!isa<lmhlo::TerminatorOp>(op)) op_list_.push_back(&op);
   }
   calculateOperandsAndResults();
@@ -487,7 +622,7 @@ FusionPatternBase::FusionPatternBase(SmallVectorImpl<Operation*>& op_list)
 // fusion pattern contains.
 int FusionPatternBase::effectiveSize() {
   return llvm::count_if(
-      op_list_, [](Operation* op) { return !matchPattern(op, m_Constant()); });
+      op_list_, [](Operation* op) { return !isa<lmhlo::ConstantOp>(op); });
 }
 
 // Sorts the ops inside the fusion pattern according to the keys provided.
@@ -574,7 +709,10 @@ void FusionPatternBase::calculateOperandsAndResults() {
 
       if (has_external_user) {
         results_.push_back(v);
-        root_ops_.push_back(op);
+        // For op with multi-output
+        if (!alreadyInRootOps(op)) {
+          root_ops_.push_back(op);
+        }
         if (!has_internal_user) {
           external_only_results_.push_back(v);
         }
@@ -607,29 +745,36 @@ FusionPattern::FusionPattern(Operation* op) : FusionPatternBase(op) {
 // Create a new fusion pattern from the ops inside the lmhlo fusion op.
 FusionPattern::FusionPattern(lmhlo::FusionOp op, ShapeAnalysis* shape_analysis)
     : FusionPatternBase(op) {
-  if (shape_analysis != nullptr) {
-    FusionType fusionType = FusionType::kNone;
-    auto deviceAttr = op->getAttrOfType<StringAttr>(kDiscPlaceAssignment);
-    auto fusionTypeAttr =
-        op->getAttrOfType<StringAttr>(kDiscFusionTypeAttrName);
-    if (fusionTypeAttr) {
-      fusionType = fusionTypeFromString(fusionTypeAttr.getValue());
-    }
-    if (!deviceAttr || fusionType == FusionType::kNone) {
-      fusion_type_ = FusionType::kNone;
-      dominant_op_ = (size() == 0 ? nullptr : getOpList()[0]);
-      return;
-    }
-    StringRef strategyStr = "base";
-    if (fusionType == FusionType::kStitch) {
-      strategyStr = "stitch";
-    }
-    FusionStrategy& strategy =
-        getFusionStrategy(deviceAttr.getValue(), strategyStr);
-    bool status = strategy.initFusionPattern(*shape_analysis, *this);
-    assert(status);
-    (void)(status);
+  assert(shape_analysis != nullptr && "shape_analysis should not be nullptr.");
+
+  FusionType fusionType = FusionType::kNone;
+  auto deviceAttr = op->getAttrOfType<StringAttr>(kDiscPlaceAssignment);
+  auto fusionTypeAttr = op->getAttrOfType<StringAttr>(kDiscFusionTypeAttrName);
+  if (fusionTypeAttr) {
+    fusionType = fusionTypeFromString(fusionTypeAttr.getValue());
   }
+  if (!deviceAttr || fusionType == FusionType::kNone) {
+    fusion_type_ = FusionType::kNone;
+    dominant_op_ = (size() == 0 ? nullptr : getOpList()[0]);
+    return;
+  }
+  StringRef strategyStr = "base";
+  if (fusionType == FusionType::kStitch) {
+    strategyStr = "stitch";
+  } else if (fusionType == FusionType::kDot) {
+    strategyStr = "dot";
+  } else if (fusionType == FusionType::kTransform) {
+    strategyStr = "transform_based";
+  } else if (fusionType == FusionType::kWhere ||
+             fusionType == FusionType::kSparseReduction) {
+    strategyStr = "sparse_base";
+  }
+
+  FusionStrategy& strategy =
+      getFusionStrategy(deviceAttr.getValue(), strategyStr);
+  bool status = strategy.initFusionPattern(*shape_analysis, *this);
+  assert(status);
+  (void)(status);
 }
 
 // Create a new fusion pattern from a valid fusion op list.
@@ -651,14 +796,32 @@ FusionPattern FusionPattern::mergeWithoutInit(FusionPattern& other) {
   return new_fusion_pattern;
 }
 
-void FusionPattern::findOpsOfSkeletonGroup(SkeletonGroup group,
-                                           DenseSet<Operation*>& ops) {
+FusionPattern FusionPattern::createWithoutInit(
+    SmallVectorImpl<Operation*>& op_list) {
+  return FusionPattern(op_list);
+}
+
+void FusionPattern::findOpsOfSkeletonGroup(
+    SkeletonGroup group, DenseSet<Operation*>& ops,
+    DenseSet<Operation*>& shmem_cached_ops,
+    const DenseMap<Operation*, SmallVector<Operation*>>& existing_group_ops,
+    int row_per_block, int& shmem_usage_bits, const int shmem_limit_bits) {
   ops.clear();
   // All operators dominanted by `group` can be traced back from skeleton op.
-  Operation* skeleton = group.skeleton;
+  SmallVector<Operation*> skeletons = group.skeletons;
   DenseSet<Operation*> fusion_ops(op_list_.begin(), op_list_.end());
   DenseSet<Operation*> xroot_members(group.root_member_list.begin(),
                                      group.root_member_list.end());
+  DenseSet<Operation*> existing_group_op_set;
+  for (auto& existing_group : existing_group_ops) {
+    existing_group_op_set.insert(existing_group.second.begin(),
+                                 existing_group.second.end());
+  }
+  DenseSet<Operation*> all_skeletons(sub_root_ops_.begin(),
+                                     sub_root_ops_.end());
+  for (auto value : external_only_results_) {
+    all_skeletons.insert(findLastWriter(value));
+  }
   std::function<void(Operation*, DenseSet<Operation*>&)> findGroupOps;
   findGroupOps = [&](Operation* op, DenseSet<Operation*>& grp_ops) {
     int64_t num_input_operand = op->getNumOperands() - getNumResultOperands(op);
@@ -668,9 +831,29 @@ void FusionPattern::findOpsOfSkeletonGroup(SkeletonGroup group,
       // Ops in current group:
       //   1. Op is in `op_list_`;
       //   2. If it is regular-xroot, it can only be owned by current group.
+      //   3. If op exists in previous groups, try to make it buffered in shared
+      //      memory.
       bool not_owned_regular_xroot = regular_xroots_.contains(input_op) &&
                                      !xroot_members.contains(input_op);
-      if (!fusion_ops.contains(input_op) || not_owned_regular_xroot) {
+      if (existing_group_op_set.contains(input_op) &&
+          !shmem_cached_ops.contains(input_op) &&
+          !all_skeletons.contains(input_op) &&
+          !isa<lmhlo::ConstantOp>(input_op)) {
+        auto output = input_op->getOperand(input_op->getNumOperands() - 1);
+        int64_t collapsed_tile_dim = getCollapsedTileDim(output);
+        auto output_type = output.getType().cast<MemRefType>();
+        if (collapsed_tile_dim != ShapedType::kDynamic) {
+          auto bit_width = row_per_block * collapsed_tile_dim *
+                           output_type.getElementType().getIntOrFloatBitWidth();
+          if (shmem_usage_bits + bit_width < shmem_limit_bits) {
+            shmem_usage_bits += bit_width;
+            shmem_cached_ops.insert(input_op);
+          }
+        }
+      }
+      bool is_prev_shmem_cached = shmem_cached_ops.contains(input_op);
+      if (!fusion_ops.contains(input_op) || not_owned_regular_xroot ||
+          is_prev_shmem_cached) {
         // TODO: to check operand of fusion?
         continue;
       }
@@ -678,8 +861,26 @@ void FusionPattern::findOpsOfSkeletonGroup(SkeletonGroup group,
       findGroupOps(input_op, grp_ops);
     }
   };
-  ops.insert(skeleton);
-  findGroupOps(skeleton, ops);
+  for (auto skeleton : skeletons) {
+    ops.insert(skeleton);
+    findGroupOps(skeleton, ops);
+  }
+}
+
+int64_t FusionPattern::getCollapsedTileDim(Value value) {
+  auto value_type = value.getType().cast<MemRefType>();
+  auto value_shape = value_type.getShape();
+  int64_t collapsed_tile_dim = 1;
+  for (auto tile : tile_plan_[value].tileSizes) {
+    int dim = tile.first;
+    if (value_shape[dim] == ShapedType::kDynamic) {
+      collapsed_tile_dim = ShapedType::kDynamic;
+      break;
+    } else {
+      collapsed_tile_dim *= value_shape[dim];
+    }
+  }
+  return collapsed_tile_dim;
 }
 
 bool getOrderedSkeletonGroups(
@@ -778,11 +979,126 @@ bool getOrderedSkeletonGroups(
       }
     }
     FusionPattern::SkeletonGroup group;
-    group.skeleton = skeleton;
+    group.skeletons = SmallVector<Operation*>({skeleton});
     group.root_member_list = std::move(root_member_list);
     group.irregular_root_member_set = std::move(irregular_members);
     groups.emplace_back(std::move(group));
   }
+
+  return true;
+}
+
+bool mergeSkeletonGroupsInOrder(
+    FusionPattern& pattern, SmallVector<FusionPattern::SkeletonGroup>& groups,
+    ShapeAnalysis* shape_analysis) {
+  const auto& op_list = pattern.getOpList();
+  DenseMap<Operation*, int64_t> op_to_node_id;
+  for (int64_t i = 0; i < op_list.size(); i++) {
+    auto op = op_list[i];
+    op_to_node_id.try_emplace(op, i);
+  }
+  GraphCycles cycle_detector(op_list.size());
+  for (int64_t node_id = 0; node_id < op_list.size(); node_id++) {
+    Operation* op = op_list[node_id];
+    for (Value operand : GetAllPossibleUsedValues(op)) {
+      Operation* operand_op = pattern.findLastWriter(operand);
+      if (operand_op == op) {
+        continue;
+      }
+      // Only consider the operand_op inside the target block.
+      auto iter = op_to_node_id.find(operand_op);
+      if (iter == op_to_node_id.end()) {
+        continue;
+      }
+      cycle_detector.InsertEdge(iter->second, node_id);
+    }
+  }
+
+  SmallVector<std::pair<int64_t, FusionPattern::SkeletonGroup>> merged_groups;
+  for (auto& group : groups) {
+    assert(group.skeletons.size() == 1);
+    merged_groups.emplace_back(op_to_node_id[group.skeletons[0]], group);
+  }
+
+  // Try to merge skeleton-groups.
+  for (int64_t i = 0; i < merged_groups.size(); i++) {
+    auto& merged = merged_groups[i];
+    auto& merged_grp = merged.second;
+    // Only deal with reduce ops currently.
+    // TODO: deal with non-reduce ops.
+    auto merged_grp_reduce =
+        dyn_cast_or_null<lmhlo::ReduceOp>(merged_grp.skeletons[0]);
+    // The value of `merged.first` is the group index after merging, which is
+    // the index of one op in the group. When one group is merged into another,
+    // the index is set to `-1`.
+    if (merged.first == -1 || !merged_grp_reduce) {
+      continue;
+    }
+    for (int64_t j = i + 1; j < merged_groups.size(); j++) {
+      auto& to_merge = merged_groups[j];
+      auto& to_merge_grp = to_merge.second;
+      auto to_merge_grp_reduce =
+          dyn_cast_or_null<lmhlo::ReduceOp>(to_merge_grp.skeletons[0]);
+      if (to_merge.first == -1 || !to_merge_grp_reduce) {
+        continue;
+      }
+      if (!shape_analysis->isShapeEqual(
+              merged_grp.skeletons[0]->getOperand(0),
+              to_merge_grp.skeletons[0]->getOperand(0))) {
+        continue;
+      }
+
+      // If one is the producer of the other, they cannot be merged.
+      if (cycle_detector.IsReachable(merged.first, to_merge.first) ||
+          cycle_detector.IsReachable(to_merge.first, merged.first)) {
+        continue;
+      }
+
+      auto optional_merged_id =
+          TryMergeNode(&cycle_detector, merged.first, to_merge.first);
+      if (!optional_merged_id.has_value()) {
+        // It forms a cycle.
+        continue;
+      }
+
+      // Merge `to_merge_grp` into `merged_grp`.
+      merged_grp.skeletons.insert(merged_grp.skeletons.end(),
+                                  to_merge_grp.skeletons.begin(),
+                                  to_merge_grp.skeletons.end());
+      merged_grp.irregular_root_member_set.insert(
+          to_merge_grp.irregular_root_member_set.begin(),
+          to_merge_grp.irregular_root_member_set.end());
+      SmallVector<Operation*> root_member_list;
+      DenseSet<Operation*> root_member_set;
+      root_member_set.insert(merged_grp.root_member_list.begin(),
+                             merged_grp.root_member_list.end());
+      root_member_set.insert(to_merge_grp.root_member_list.begin(),
+                             to_merge_grp.root_member_list.end());
+      for (auto op : op_list) {
+        if (root_member_set.contains(op)) {
+          root_member_list.push_back(op);
+        }
+      }
+      merged_grp.root_member_list = std::move(root_member_list);
+
+      // Set `to_merge` invalid.
+      to_merge.first = -1;
+      merged.first = *optional_merged_id;
+    }
+  }
+
+  std::vector<int32_t> ordered_nodes = cycle_detector.AllNodesInPostOrder();
+  std::reverse(ordered_nodes.begin(), ordered_nodes.end());
+  SmallVector<FusionPattern::SkeletonGroup> result;
+  for (auto id : ordered_nodes) {
+    for (auto& group : merged_groups) {
+      if (group.first == id) {
+        result.push_back(group.second);
+        break;
+      }
+    }
+  }
+  groups = std::move(result);
 
   return true;
 }
@@ -822,6 +1138,12 @@ bool FusionStrategy::isFusible(FusionPattern& fusion_pattern) {
   return true;
 }
 
+bool FusionStrategy::pruneFusionPattern(
+    ShapeAnalysis& shapeAnalysis, FusionPattern& fused_pattern,
+    SmallVectorImpl<Operation*>& excluded_ops) {
+  return true;
+}
+
 bool FusionStrategy::tryFuseInplace(ShapeAnalysis& shapeAnalysis,
                                     FusionPattern& lhs, FusionPattern& rhs) {
   // both lhs & rhs should be fusible
@@ -836,6 +1158,7 @@ bool FusionStrategy::tryFuseInplace(ShapeAnalysis& shapeAnalysis,
     return false;
   }
   lhs = result;
+
   return true;
 }
 
@@ -856,7 +1179,7 @@ bool FusionStrategy::tryFuse(ShapeAnalysis& shapeAnalysis, FusionPattern& lhs,
   // pattern.
   // TODO(disc): copy small const in case necessary.
   for (Operation* result_op : target.getRootOps()) {
-    if (isa<lmhlo::ConstOp>(result_op)) {
+    if (isa<lmhlo::ConstantOp>(result_op)) {
       return false;
     }
   }
@@ -866,25 +1189,6 @@ bool FusionStrategy::tryFuse(ShapeAnalysis& shapeAnalysis, FusionPattern& lhs,
 
 ////////////////////// Base FusionStrategy Implemenation /////////
 //////////////////////////////////////////////////////////////////
-class BaseFusionStrategy : public FusionStrategy {
- public:
-  using FusionStrategy::FusionStrategy;
-
-  using FusionStrategy::isFusible;
-  bool isFusible(FusionPattern& fusion_pattern) override;
-  bool tryFuse(ShapeAnalysis& shapeAnalysis, FusionPattern& lhs,
-               FusionPattern& rhs, FusionPattern& target) override;
-  bool initFusionPattern(ShapeAnalysis& shapeAnalysis,
-                         FusionPattern& fusion_pattern) override;
-  virtual StringRef getName() override { return "BaseFusionStrategy"; }
-
- protected:
-  virtual Value getEffectiveShape(FusionPattern& target, Value value) = 0;
-  virtual bool checkSameShape(FusionPattern& lhs, FusionPattern& rhs,
-                              FusionPattern& target) {
-    return false;
-  }
-};
 
 bool BaseFusionStrategy::isFusible(FusionPattern& fusion_pattern) {
   if (fusion_pattern.isStitchFusion()) return false;
@@ -893,37 +1197,7 @@ bool BaseFusionStrategy::isFusible(FusionPattern& fusion_pattern) {
 
 bool BaseFusionStrategy::initFusionPattern(ShapeAnalysis& shapeAnalysis,
                                            FusionPattern& fusion_pattern) {
-  Operation* inferredDominantOp = nullptr;
-  FusionType inferredFusionType = FusionType::kNone;
-  for (Operation* op : fusion_pattern.getOpList()) {
-    if (isRank2RowReduction(op)) {
-      inferredFusionType = FusionType::kRowReduction;
-      inferredDominantOp = op;
-    } else if (isRank2ColReduction(op)) {
-      if (inferredFusionType != FusionType::kRowReduction) {
-        inferredFusionType = FusionType::kColReduction;
-        inferredDominantOp = op;
-      }
-    } else if (this->isFusible(op)) {
-      // Ignore if already a kRowReduction or kColReduction, otherwise update
-      // the fusion type to kLoop and dominant op to current op. This supposes
-      // that the last op inside the block is a valid candidate dominant op if
-      // the fusion pattern is a kLoop.
-      if (inferredFusionType == FusionType::kNone ||
-          inferredFusionType == FusionType::kLoop) {
-        inferredFusionType = FusionType::kLoop;
-        inferredDominantOp = op;
-      }
-    } else if (!isa<lmhlo::TerminatorOp>(op)) {
-      // Not a supported fusionOp, early stop.
-      inferredFusionType = FusionType::kNone;
-      inferredDominantOp = nullptr;
-      break;
-    }
-  }
-  fusion_pattern.setDominantOp(inferredDominantOp);
-  fusion_pattern.setFusionType(inferredFusionType);
-  return (inferredFusionType != FusionType::kNone && inferredDominantOp);
+  return initFusionPatternBase(shapeAnalysis, fusion_pattern);
 }
 
 bool BaseFusionStrategy::tryFuse(ShapeAnalysis& shapeAnalysis,
@@ -963,15 +1237,23 @@ bool BaseFusionStrategy::tryFuse(ShapeAnalysis& shapeAnalysis,
     return true;
   }
 
-  Value ref_shape = getEffectiveShape(target, results[0]);
-  if (!llvm::all_of(results, [&](Value result) {
-        Value shape = getEffectiveShape(target, result);
-        return checkSameShape(lhs, rhs, target)
-                   ? shapeAnalysis.isShapeEqual(ref_shape, shape)
-                   : shapeAnalysis.HasSameNumElements(ref_shape, shape);
-      })) {
+  if (!isSparseFusion(rhs) && !isSparseFusion(lhs)) {
+    Value ref_shape = getEffectiveShape(target, results[0]);
+    if (!llvm::all_of(results, [&](Value result) {
+          Value shape = getEffectiveShape(target, result);
+          return checkSameShape(lhs, rhs, target)
+                     ? shapeAnalysis.isShapeEqual(ref_shape, shape)
+                     : shapeAnalysis.isSameNumElements(ref_shape, shape);
+        })) {
+      return false;
+    }
+  } else {
+    LLVM_DEBUG(
+        llvm::dbgs()
+        << "BaseFusionStrategy::tryFuse does not handle sparse fusion\n");
     return false;
   }
+
   LLVM_DEBUG(llvm::dbgs() << "BaseFusionStrategy::tryFuse success()\n");
   return true;
 }
@@ -991,23 +1273,14 @@ class BaseCpuFusionStrategy : public BaseFusionStrategy {
   virtual StringRef getName() override { return "BaseCpuFusionStrategy"; }
 };
 
-bool enableEagerTransposeFusion() {
-  static const char* env = getenv("DISC_CPU_ENABLE_EAGER_TRANSPOSE_FUSION");
-  if (!env) return false;
-  std::string envStr = env;
-  std::transform(envStr.begin(), envStr.end(), envStr.begin(),
-                 [](unsigned char c) { return std::tolower(c); });
-  return envStr == "true" || envStr == "1";
-}
-
 bool BaseCpuFusionStrategy::isFusible(Operation* op) {
   if (isa<lmhlo::ReshapeOp, lmhlo::DynamicReshapeOp>(op)) {
-    return false;
+    return useShapeConstraintIR();
   }
 
   if (!enableEagerTransposeFusion()) {
     if (auto transposeOp = dyn_cast<lmhlo::TransposeOp>(op)) {
-      auto permutation = transposeOp.permutation().getValues<int64_t>();
+      auto permutation = transposeOp.getPermutation().getValues<int64_t>();
       if (*--permutation.end() != permutation.size() - 1) return false;
     }
   }
@@ -1042,11 +1315,17 @@ bool BaseCpuFusionStrategy::initFusionPattern(ShapeAnalysis& shapeAnalysis,
       // the fusion type to kLoop and dominant op to current op. This supposes
       // that the last op inside the block is a valid candidate dominant op if
       // the fusion pattern is a kLoop.
-      if (inferredFusionType == FusionType::kNone ||
-          inferredFusionType == FusionType::kLoop) {
-        inferredFusionType = FusionType::kLoop;
+      if (!isa<lmhlo_disc::WhereOp>(op)) {
+        if (inferredFusionType == FusionType::kNone ||
+            inferredFusionType == FusionType::kLoop) {
+          inferredFusionType = FusionType::kLoop;
+          inferredDominantOp = op;
+        }
+      } else {
+        inferredFusionType = FusionType::kWhere;
         inferredDominantOp = op;
       }
+
     } else if (!isa<lmhlo::TerminatorOp>(op)) {
       // Not a supported fusionOp, early stop.
       inferredFusionType = FusionType::kNone;
@@ -1074,6 +1353,48 @@ bool isLargeConcatOp(Operation* op) {
          op->getNumOperands() >= getLargeConcatNumOperandsLimit();
 }
 
+bool isExpandLikeReshape(ShapeAnalysis& shapeAnalysis, Operation* op) {
+  auto shapeIRAnalysis =
+      dynamic_cast<ShapeConstraintIRAnalysis*>(&shapeAnalysis);
+  if (!shapeIRAnalysis) return false;
+
+  Value in = op->getOperand(0);
+  Value out = cast<lmhlo::LmhloOp>(op).getResultBuffer();
+  auto inTy = in.getType().cast<MemRefType>();
+  auto outTy = out.getType().cast<MemRefType>();
+  if (inTy.hasStaticShape() && outTy.hasStaticShape()) {
+    for (int inIdx = 0, outIdx = 0; true; ++inIdx, ++outIdx) {
+      while (inIdx < inTy.getRank() && inTy.getShape()[inIdx] == 1) ++inIdx;
+      while (outIdx < outTy.getRank() && outTy.getShape()[outIdx] == 1)
+        ++outIdx;
+      if ((inIdx == inTy.getRank()) != (outIdx == outTy.getRank()))
+        return false;
+      if ((inIdx == inTy.getRank()) && (outIdx == outTy.getRank())) return true;
+      if (inTy.getShape()[inIdx] != outTy.getShape()[outIdx]) return false;
+    }
+  }
+
+  auto inSyms =
+      getMemRefValueSymbolicDims(shapeIRAnalysis->symbolicDimMgr(), in);
+  auto outSyms =
+      getMemRefValueSymbolicDims(shapeIRAnalysis->symbolicDimMgr(), out);
+  if (!inSyms.has_value() || !outSyms.has_value()) return false;
+
+  for (size_t inIdx = 0, outIdx = 0; true; ++inIdx, ++outIdx) {
+    while (inIdx < (*inSyms).size() && (*inSyms)[inIdx].getDimSize() == 1)
+      ++inIdx;
+    while (outIdx < (*outSyms).size() && (*outSyms)[outIdx].getDimSize() == 1)
+      ++outIdx;
+    if ((inIdx == (*inSyms).size()) != (outIdx == (*outSyms).size()))
+      return false;
+    if ((inIdx == (*inSyms).size()) && (outIdx == (*outSyms).size()))
+      return true;
+    if (inTy.getShape()[inIdx] != outTy.getShape()[outIdx]) return false;
+  }
+
+  return false;
+}
+
 bool BaseCpuFusionStrategy::tryFuse(ShapeAnalysis& shapeAnalysis,
                                     FusionPattern& lhs, FusionPattern& rhs,
                                     FusionPattern& target) {
@@ -1084,6 +1405,14 @@ bool BaseCpuFusionStrategy::tryFuse(ShapeAnalysis& shapeAnalysis,
   auto& op_list = target.getOpList();
   auto& operands = target.getOperands();
   auto& results = target.getResults();
+
+  // Only support expand-like reshape a.t.m.
+  for (Operation* op : op_list) {
+    if (isa<lmhlo::ReshapeOp, lmhlo::DynamicReshapeOp>(op) &&
+        !isExpandLikeReshape(shapeAnalysis, op))
+      return false;
+  }
+
   bool has_reduce_root = llvm::any_of(target.getRootOps(), [](Operation* op) {
     return isa<lmhlo::ReduceOp>(op);
   });
@@ -1116,27 +1445,16 @@ bool BaseCpuFusionStrategy::tryFuse(ShapeAnalysis& shapeAnalysis,
   return true;
 }
 
-////////////////////// Base GPU FusionStrategy Implemenation /////////
+////////////////////// Base GPU FusionStrategy Implementation /////////
 //////////////////////////////////////////////////////////////////
-class BaseGpuFusionStrategy : public BaseFusionStrategy {
- public:
-  using BaseFusionStrategy::BaseFusionStrategy;
-
-  bool isFusible(Operation* op) override;
-  bool checkSameShape(FusionPattern& lhs, FusionPattern& rhs,
-                      FusionPattern& target) {
-    return lhs.isKInputFusion() && rhs.isKInputFusion();
-  }
-
-  Value getEffectiveShape(FusionPattern& target, Value v) override;
-  virtual StringRef getName() override { return "BaseGpuFusionStrategy"; }
-};
 
 bool BaseGpuFusionStrategy::isFusible(Operation* op) {
   // Only rank-2 tensor -> rank-1 tensor reduction are supported now.
   if (isa<lmhlo::ReduceOp>(op) &&
       (!isRank2RowReduction(op) && !isRank2ColReduction(op)))
     return false;
+
+  if (isa<lmhlo::TransposeOp>(op) && isRank2or3Transpose(op)) return false;
   return BaseFusionStrategy::isFusible(op);
 }
 
@@ -1144,7 +1462,42 @@ Value BaseGpuFusionStrategy::getEffectiveShape(FusionPattern& target, Value v) {
   Operation* result_op = target.findLastWriter(v);
   assert(result_op);
   // effective shape of reduce op is its operand's shape.
-  return isa<lmhlo::ReduceOp>(result_op) ? result_op->getOperand(0) : v;
+  if (isa<lmhlo::ReduceOp>(result_op)) {
+    return result_op->getOperand(0);
+  } else if (isa<lmhlo::DynamicUpdateSliceOp>(result_op) &&
+             isInplaceOperator(result_op)) {
+    return result_op->getOperand(1);
+  }
+  return v;
+}
+
+bool BaseGpuFusionStrategy::tryFuse(ShapeAnalysis& shapeAnalysis,
+                                    FusionPattern& lhs, FusionPattern& rhs,
+                                    FusionPattern& target) {
+  // TODO(Yancey): support fusion with different reduction type
+  bool has_rank2_row_reduction =
+      llvm::any_of(target.getOpList(),
+                   [](Operation* op) { return isRank2RowReduction(op); });
+  bool has_rank2_col_reduction =
+      llvm::any_of(target.getOpList(),
+                   [](Operation* op) { return isRank2ColReduction(op); });
+
+  if (has_rank2_row_reduction && has_rank2_col_reduction) {
+    return false;
+  }
+
+  if (has_rank2_col_reduction) {
+    const auto& results = target.getResults();
+    auto ref_shape = getEffectiveShape(target, results[0]);
+    if (llvm::any_of(results, [&](Value result) {
+          auto op = target.findLastWriter(result);
+          return isa<lmhlo::TransposeOp>(op);
+        })) {
+      return false;
+    }
+  }
+
+  return BaseFusionStrategy::tryFuse(shapeAnalysis, lhs, rhs, target);
 }
 
 ////////////////////// Stitch-Base CPU FusionStrategy Implemenation /////
@@ -1165,6 +1518,12 @@ bool isStitchCpuSupported(Operation* op) {
   // TODO(kevin.zwy): support other reduction types.
   if (isa<lmhlo::ReduceOp>(op) && !isRowReduction(op)) {
     return false;
+  }
+
+  // Reshape-like ops
+  if (useShapeConstraintIR() &&
+      isa<lmhlo::ReshapeOp, lmhlo::DynamicReshapeOp>(op)) {
+    return true;
   }
 
   // clang-format off
@@ -1214,7 +1573,7 @@ bool StitchCpuFusionStrategy::tryFuse(ShapeAnalysis& shapeAnalysis,
     return false;
   }
 
-  StitchCPUAnalysis stitchAnalysis(target);
+  StitchCPUAnalysis stitchAnalysis(target, shapeAnalysis);
   if (!stitchAnalysis.fusibilityAnalysis()) {
     LLVM_DEBUG(llvm::dbgs() << "fusibilityAnalysis failed\n");
     return false;
@@ -1224,7 +1583,11 @@ bool StitchCpuFusionStrategy::tryFuse(ShapeAnalysis& shapeAnalysis,
 
 bool StitchCpuFusionStrategy::initFusionPattern(ShapeAnalysis& shapeAnalysis,
                                                 FusionPattern& fusion_pattern) {
-  fusion_pattern.setFusionType(FusionType::kStitch);
+  StitchCPUAnalysis stitchAnalysis(fusion_pattern, shapeAnalysis);
+  if (!stitchAnalysis.fusibilityAnalysis())
+    fusion_pattern.setFusionType(FusionType::kNone);
+  else
+    fusion_pattern.setFusionType(FusionType::kStitch);
   return true;
 }
 
@@ -1238,12 +1601,23 @@ std::unique_ptr<FusionStrategy> makeNewDeviceStrategy(StringRef device,
     return std::make_unique<BaseGpuFusionStrategy>(options);
   } else if (device == placement_utils::kCpu && strategy == "stitch") {
     return std::make_unique<StitchCpuFusionStrategy>(options);
+  } else if (device == placement_utils::kCpu && strategy == "transform_based") {
+    return std::make_unique<TransformBasedCpuFusionStrategy>(options);
+  } else if (device == placement_utils::kCpu && strategy == "sparse_base") {
+    return std::make_unique<SparseOpCpuFusionStrategy>(options);
   } else if (device == placement_utils::kGpu && strategy == "stitch") {
     return std::make_unique<StitchGpuFusionStrategy>(options);
   } else if (device == placement_utils::kCpu && strategy == "stitch_base") {
     return std::make_unique<StitchBaseCpuFusionStrategy>(options);
+  } else if (device == placement_utils::kGpu && strategy == "pre_dot") {
+    return std::make_unique<PreDotGpuFusionStrategy>(options);
+  } else if (device == placement_utils::kGpu && strategy == "dot") {
+    return std::make_unique<DotGpuFusionStrategy>(options);
+  } else if (device == placement_utils::kGpu && strategy == "transform_based") {
+    return std::make_unique<TransformBasedGpuFusionStrategy>(options);
   } else {
     assert(false && "not support fusion strategy");
+    return nullptr;
   }
 }
 
@@ -1267,56 +1641,17 @@ FusionStrategy& getFusionStrategy(StringRef device, StringRef strategy) {
   return *it->second;
 }
 
-using DeviceStrategyMap = DenseMap<StringRef, FusionStrategy*>;
-
-class PlacementAwareFusionStrategy : public FusionStrategy {
- public:
-  PlacementAwareFusionStrategy(const FusionOptions& options,
-                               StringRef defaultDevice,
-                               DeviceStrategyMap deviceStrategyMap)
-      : FusionStrategy(options),
-        deviceStrategyMap_(std::move(deviceStrategyMap)),
-        defaultDevice_(defaultDevice) {}
-
-  bool isFusible(Operation* op) override;
-  bool isFusible(FusionPattern& fusion_pattern) override;
-  bool tryFuse(ShapeAnalysis& shapeAnalysis, FusionPattern& lhs,
-               FusionPattern& rhs, FusionPattern& target) override;
-  bool initFusionPattern(ShapeAnalysis& shapeAnalysis,
-                         FusionPattern& fusion_pattern) override;
-  virtual StringRef getName() override {
-    return "PlacementAwareFusionStrategy";
-  }
-
- private:
-  StringRef getPlacement(Operation* op);
-  StringRef getPlacement(FusionPattern& fusion_pattern) {
-    return getPlacement(fusion_pattern.getDominantOp());
-  }
-  FusionStrategy* getStrategy(StringRef placement);
-  FusionStrategy* getStrategy(Operation* op) {
-    return getStrategy(getPlacement(op));
-  }
-  FusionStrategy* getStrategy(FusionPattern& fusion_pattern) {
-    return getStrategy(getPlacement(fusion_pattern));
-  }
-
-  StringRef defaultDevice_;
-  DeviceStrategyMap deviceStrategyMap_;
-};
-
 StringRef PlacementAwareFusionStrategy::getPlacement(Operation* op) {
-  if (!op) return "";
-  auto attr = op->getAttrOfType<StringAttr>(kDiscPlaceAssignment);
-  if (attr) return attr.getValue();
+  return placement_utils::isGpuLmhlo(op) ? placement_utils::kGpu
+                                         : placement_utils::kCpu;
+}
 
-  if (auto lmhloOp = dyn_cast<lmhlo::LmhloOp>(op)) {
-    auto memorySpace =
-        lmhloOp.getResultBuffer().getType().cast<MemRefType>().getMemorySpace();
-    if (auto strAttr = memorySpace.dyn_cast<StringAttr>())
-      return strAttr.getValue();
-  }
-  return defaultDevice_;
+StringRef PlacementAwareFusionStrategy::getPlacement(
+    FusionPattern& fusion_pattern) {
+  auto op = !fusion_pattern.getRootOps().empty()
+                ? fusion_pattern.getRootOps()[0]
+                : nullptr;
+  return getPlacement(op);
 }
 
 FusionStrategy* PlacementAwareFusionStrategy::getStrategy(StringRef placement) {
@@ -1355,6 +1690,19 @@ bool PlacementAwareFusionStrategy::initFusionPattern(
   return strategy && strategy->initFusionPattern(shapeAnalysis, fusion_pattern);
 }
 
+bool PlacementAwareFusionStrategy::pruneFusionPattern(
+    ShapeAnalysis& shapeAnalysis, FusionPattern& fusion_pattern,
+    SmallVectorImpl<Operation*>& excluded_ops) {
+  if (fusion_pattern.getOpList().empty() ||
+      fusion_pattern.getFusionType() == FusionType::kNone) {
+    // Do not deal with invalid fusion pattern.
+    return true;
+  }
+  FusionStrategy* strategy = getStrategy(fusion_pattern.getOpList()[0]);
+  return strategy && strategy->pruneFusionPattern(shapeAnalysis, fusion_pattern,
+                                                  excluded_ops);
+}
+
 std::unique_ptr<FusionStrategy> makeNewPlacementAwareFusionStrategy(
     bool gpu_enabled, StringRef fusion_strategy) {
   DeviceStrategyMap deviceStrategyMap;
@@ -1385,12 +1733,12 @@ void StitchCPUAnalysis::dumpParallelPlan() {
     llvm::dbgs() << "  value: " << en.first << "\n";
     for (const auto& en2 : llvm::enumerate(en.second)) {
       llvm::dbgs() << "  parallel info #" << en2.index() << ": ";
-      int test = en2.value();
+      int64_t test = en2.value();
       auto& info = parallelInfoStore_[test];
       llvm::dbgs() << "id@prevId: " << info.id << "@" << info.producerId
                    << " || ";
       llvm::dbgs() << "consumerIds: ";
-      for (int id : info.consumerIds) llvm::dbgs() << id << " ";
+      for (int64_t id : info.consumerIds) llvm::dbgs() << id << " ";
       llvm::dbgs() << " || ";
       for (auto& innerEn : info.indices) {
         llvm::dbgs() << innerEn.first << " : "
@@ -1405,6 +1753,25 @@ bool StitchCPUAnalysis::fusibilityAnalysis() {
   auto& target = fusionPattern_;
   // 0, All ops in the pattern should be supported.
   if (!llvm::all_of(target.getOpList(), isStitchCpuSupported)) {
+    LLVM_DEBUG(llvm::dbgs() << "found unsupported op.\n");
+    return false;
+  }
+
+  // Only support expand-like reshape a.t.m.
+  if (!llvm::all_of(target.getOpList(), [&](Operation* op) {
+        if (!isa<lmhlo::ReshapeOp, lmhlo::DynamicReshapeOp>(op)) return true;
+        auto inTy = op->getOperand(0).getType().cast<MemRefType>();
+        auto outTy = cast<lmhlo::LmhloOp>(op)
+                         .getResultBuffer()
+                         .getType()
+                         .cast<MemRefType>();
+        // TODO(disc): support rank 0 reshape.
+        if ((inTy.hasStaticShape() && inTy.getNumElements() == 1) ||
+            (outTy.hasStaticShape() && outTy.getNumElements() == 1))
+          return false;
+        // TODO(disc): support other kinds of reshapes.
+        return isExpandLikeReshape(shapeAnalysis_, op);
+      })) {
     LLVM_DEBUG(llvm::dbgs() << "found unsupported op.\n");
     return false;
   }
@@ -1463,7 +1830,7 @@ bool StitchCPUAnalysis::buildDominantGraph(ValueGraph& dominantGraph) {
 
   // init edges
   for (Operation* op : fusionPattern_.getOpList()) {
-    if (isa<lmhlo::ConstOp>(op)) continue;
+    if (isa<lmhlo::ConstantOp>(op)) continue;
     if (isElementWise(op)) {
       // all operands are equal
       for (Value a : op->getOperands())
@@ -1477,6 +1844,10 @@ bool StitchCPUAnalysis::buildDominantGraph(ValueGraph& dominantGraph) {
       Value a = cast<lmhlo::LmhloOp>(op).getResultBuffer();
       Value b = op->getOperand(0);
       dominantGraph[a][b] = true;
+    } else if (isa<lmhlo::ReshapeOp, lmhlo::DynamicReshapeOp>(op)) {
+      Value a = cast<lmhlo::LmhloOp>(op).getResultBuffer();
+      Value b = op->getOperand(0);
+      dominantGraph[a][b] = dominantGraph[b][a] = true;
     } else {
       // failure due to unknown ops
       return false;
@@ -1529,17 +1900,17 @@ bool TileInfo::merge(TileInfo& other) {
 }
 
 // Returns false if failed to merge.
-bool TileInfo::merge(int axis, int tileSize) {
+bool TileInfo::merge(int64_t axis, int64_t tileSize) {
   auto it = tileSizes.find(axis);
   if (it == tileSizes.end()) {
     tileSizes[axis] = tileSize;
     return true;
   }
 
-  int minSize = std::min(it->second, tileSize);
-  int maxSize = std::max(it->second, tileSize);
-  if (minSize == ShapedType::kDynamicSize) {
-    it->second = ShapedType::kDynamicSize;
+  int64_t minSize = std::min(it->second, tileSize);
+  int64_t maxSize = std::max(it->second, tileSize);
+  if (minSize == ShapedType::kDynamic) {
+    it->second = ShapedType::kDynamic;
     return true;
   }
 
@@ -1557,8 +1928,8 @@ bool TileInfo::updateIfNotEqual(TileInfo& other) {
 
 // Assigns a tile sizes for each buffers.
 // Take buffer `a` memref<?x?x?xf32> as an example:
-//  Tile(a) = {0 : -1}: means axis 0 is fully selected as tile
-//  Tile(a) = {1 : -1, 2 : 4}: means axis 1 is fully selected and
+//  Tile(a) = {0 : kDynamic}: means axis 0 is fully selected as tile
+//  Tile(a) = {1 : kDynamic, 2 : 4}: means axis 1 is fully selected and
 //                             tile size for axis 2 is 4.
 bool StitchCPUAnalysis::doTileAnalysis() {
   bool changed = false;
@@ -1566,7 +1937,7 @@ bool StitchCPUAnalysis::doTileAnalysis() {
   do {
     changed = false;
     for (Operation* op : fusionPattern_.getOpList()) {
-      if (isa<lmhlo::ConstOp>(op)) continue;
+      if (isa<lmhlo::ConstantOp>(op)) continue;
       if (isElementWise(op)) {
         if (!doElemOpTileAnalysis(tilePlan, op, changed)) return false;
       } else if (isa<lmhlo::ReduceOp>(op)) {
@@ -1574,6 +1945,8 @@ bool StitchCPUAnalysis::doTileAnalysis() {
       } else if (isa<lmhlo::BroadcastInDimOp, lmhlo::BroadcastOp,
                      lmhlo::DynamicBroadcastInDimOp>(op)) {
         if (!doBcastOpTileAnalysis(tilePlan, op, changed)) return false;
+      } else if (isa<lmhlo::ReshapeOp, lmhlo::DynamicReshapeOp>(op)) {
+        if (!doReshapeOpTileAnalysis(tilePlan, op, changed)) return false;
       } else {
         // failure due to unknown ops
         return false;
@@ -1600,7 +1973,7 @@ bool StitchCPUAnalysis::doElemOpTileAnalysis(
 bool StitchCPUAnalysis::doReduceOpTileAnalysis(
     DenseMap<Value, TileInfo>& tilePlan, Operation* op, bool& changed) {
   auto reduce = cast<lmhlo::ReduceOp>(op);
-  auto dimensions = reduce.dimensions().getValues<int64_t>();
+  auto dimensions = reduce.getDimensions().getValues<int64_t>();
   // init value should not do parallel computation.
   // Zero-rank init value does not need to assign a tile info, thus skip it.
   if (auto rank = op->getOperand(1).getType().cast<MemRefType>().getRank()) {
@@ -1690,6 +2063,56 @@ bool StitchCPUAnalysis::doBcastOpTileAnalysis(
   return true;
 }
 
+SmallVector<int> getNonSizeOneDims(MemRefType ty) {
+  SmallVector<int> dims;
+  for (int i = 0; i < ty.getRank(); ++i)
+    if (ty.getShape()[i] != 1) dims.push_back(i);
+  return dims;
+}
+
+bool StitchCPUAnalysis::doReshapeOpTileAnalysis(
+    DenseMap<Value, TileInfo>& tilePlan, Operation* op, bool& changed) {
+  Value inValue = op->getOperand(0);
+  Value outValue = cast<lmhlo::LmhloOp>(op).getResultBuffer();
+  // target_shape should not do parallel computation.
+  if (isa<lmhlo::DynamicReshapeOp>(op)) {
+    auto& targetShape = tilePlan[op->getOperand(1)];
+    TileInfo mergedInfo = targetShape;
+    if (!mergedInfo.merge(0)) return false;
+    changed |= targetShape.updateIfNotEqual(mergedInfo);
+  }
+
+  auto propagateTileDims = [&](Value in, TileInfo& inInfo, Value out,
+                               TileInfo& outInfo) {
+    auto inTy = in.getType().cast<MemRefType>();
+    auto inNonSizeOneDims = getNonSizeOneDims(inTy);
+    auto outTy = out.getType().cast<MemRefType>();
+    auto outNonSizeOneDims = getNonSizeOneDims(outTy);
+
+    if (inNonSizeOneDims.size() != outNonSizeOneDims.size()) return false;
+    for (const auto& z : llvm::zip(inNonSizeOneDims, outNonSizeOneDims)) {
+      int inIdx, outIdx;
+      std::tie(inIdx, outIdx) = z;
+      auto outIt = outInfo.tileSizes.find(outIdx);
+      if (outIt != outInfo.tileSizes.end())
+        if (!inInfo.merge(inIdx, outIt->second)) return false;
+    }
+    return true;
+  };
+
+  TileInfo inMergedInfo = tilePlan[inValue];
+  TileInfo outMergedInfo = tilePlan[outValue];
+
+  if (!propagateTileDims(inValue, inMergedInfo, outValue, outMergedInfo) ||
+      !propagateTileDims(outValue, outMergedInfo, inValue, inMergedInfo)) {
+    return false;
+  }
+
+  changed |= tilePlan[inValue].updateIfNotEqual(inMergedInfo);
+  changed |= tilePlan[outValue].updateIfNotEqual(outMergedInfo);
+  return true;
+}
+
 // Analyzes parallel indices of dominant value to roots & all related producer
 // buffers.
 bool StitchCPUAnalysis::doParallelAnalysis() {
@@ -1720,28 +2143,48 @@ bool StitchCPUAnalysis::doParallelAnalysis() {
 }
 
 // Creates a new parallel index.
-ParallelIndex& StitchCPUAnalysis::makeParallelIndex(int64_t step) {
+ParallelIndex& StitchCPUAnalysis::makeParallelIndex(int64_t step,
+                                                    int64_t value) {
+  // Return early if a existing const parallel index.
+  if (value != ShapedType::kDynamic) {
+    auto it = constParallelIndexStore_.find(value);
+    if (it != constParallelIndexStore_.end())
+      return parallelIndexStore_[it->second];
+  }
+
   int id = newSymbolId();
-  return parallelIndexStore_[id] = ParallelIndex{id, step};
+  // Cache const parallel index
+  if (value != ShapedType::kDynamic) constParallelIndexStore_[value] = id;
+  return parallelIndexStore_[id] = ParallelIndex{id, step, value};
 }
 
 // Creates a new parallel info.
 ParallelInfo& StitchCPUAnalysis::makeParallelInfo(Value value, int producerId,
                                                   Operation* op) {
-  int rank = value.getType().cast<MemRefType>().getRank();
+  auto ty = value.getType().cast<MemRefType>();
+  int rank = ty.getRank();
   auto& tileInfo = tilePlan_[value];
   ParallelInfo parallelInfo;
   parallelInfo.value = value;
   parallelInfo.producerId = producerId;
   parallelInfo.op = op;
   for (int d = 0; d < rank; ++d) {
+    int64_t dimSize = ty.getShape()[d];
     auto it = tileInfo.tileSizes.find(d);
     if (it == tileInfo.tileSizes.end()) {
+      bool isAlwaysZeroIndex =
+          (dimSize != ShapedType::kDynamic && dimSize <= 1);
       // select the whole dimension
-      parallelInfo.indices[d] = makeParallelIndex(1).id;
-    } else if (it->second != ShapedType::kDynamicSize) {
+      parallelInfo.indices[d] =
+          makeParallelIndex(1, isAlwaysZeroIndex ? 0 : ShapedType::kDynamic).id;
+    } else if (it->second != ShapedType::kDynamic) {
+      bool isAlwaysZeroIndex =
+          (dimSize != ShapedType::kDynamic && dimSize <= it->second);
       // partially select the dimension.
-      parallelInfo.indices[d] = makeParallelIndex(it->second).id;
+      parallelInfo.indices[d] =
+          makeParallelIndex(it->second,
+                            isAlwaysZeroIndex ? 0 : ShapedType::kDynamic)
+              .id;
     }
   }
   parallelInfo.inBound = newSymbolId();
@@ -1786,7 +2229,7 @@ bool StitchCPUAnalysis::propagateFromDominantToRoots() {
     auto info = parallelInfoStore_[*plan.begin()];
     for (Operation* user : getValueUsers(v)) {
       if (!isTargetOp(user)) continue;
-      if (isa<lmhlo::ConstOp>(user)) continue;
+      if (isa<lmhlo::ConstantOp>(user)) continue;
       if (isElementWise(user)) {
         for (Value other : user->getOperands()) {
           if (v == other || !processedSet.insert(other).second) continue;
@@ -1804,7 +2247,7 @@ bool StitchCPUAnalysis::propagateFromDominantToRoots() {
         otherInfo.inBound = info.inBound;
         otherInfo.isOwner = info.isOwner;
         otherInfo.indices.clear();
-        auto dimensions = reduce.dimensions().getValues<int64_t>();
+        auto dimensions = reduce.getDimensions().getValues<int64_t>();
         int rank = v.getType().cast<MemRefType>().getRank();
         int outIdx = 0;
         for (int d = 0; d < rank; ++d) {
@@ -1841,6 +2284,30 @@ bool StitchCPUAnalysis::propagateFromDominantToRoots() {
           ++inIdx;
         }
         updateToProcess(other, otherInfo.id);
+      } else if (isa<lmhlo::ReshapeOp, lmhlo::DynamicReshapeOp>(user)) {
+        Value inValue = user->getOperand(0);
+        Value outValue = cast<lmhlo::LmhloOp>(user).getResultBuffer();
+        // skip the second operand (target shape) of dynamic reshape op.
+        if (v != inValue && v != outValue) continue;
+        Value from = inValue;
+        Value to = outValue;
+        if (v == outValue) std::swap(from, to);
+        if (!processedSet.insert(to).second) continue;
+        auto& toInfo = makeParallelInfo(to, info.id, user);
+        toInfo.inBound = info.inBound;
+        toInfo.isOwner = info.isOwner;
+        auto fromTy = from.getType().cast<MemRefType>();
+        auto fromNonSizeOneDims = getNonSizeOneDims(fromTy);
+        auto toTy = to.getType().cast<MemRefType>();
+        auto toNonSizeOneDims = getNonSizeOneDims(toTy);
+        for (const auto& z : llvm::zip(fromNonSizeOneDims, toNonSizeOneDims)) {
+          int fromIdx, toIdx;
+          std::tie(fromIdx, toIdx) = z;
+          auto it = toInfo.indices.find(toIdx);
+          if (it == toInfo.indices.end()) continue;
+          toInfo.indices[toIdx] = info.indices[fromIdx];
+        }
+        updateToProcess(to, toInfo.id);
       } else {
         // failure due to unknown ops
         return false;
@@ -1906,7 +2373,7 @@ bool StitchCPUAnalysis::propagateFromRootsToProducers() {
                << "back-root-indices for #" << id << " of op: " << *op << "\n");
     parallelInfoStore_[id].consumedByRoots = true;
     // No need to do propagation for const ops
-    if (isa<lmhlo::ConstOp>(op)) continue;
+    if (isa<lmhlo::ConstantOp>(op)) continue;
     Value out = cast<lmhlo::LmhloOp>(op).getResultBuffer();
     auto isExistingInputId = [&](Value in, int& inId) {
       auto& info = parallelInfoStore_[id];
@@ -1963,7 +2430,7 @@ bool StitchCPUAnalysis::propagateFromRootsToProducers() {
         inInfo.inBound = info.inBound;
         inInfo.isOwner = info.isOwner;
         inInfo.indices.clear();
-        auto dimensions = reduce.dimensions().getValues<int64_t>();
+        auto dimensions = reduce.getDimensions().getValues<int64_t>();
         int rank = in.getType().cast<MemRefType>().getRank();
         int outIdx = 0;
         for (int d = 0; d < rank; ++d) {
@@ -2012,6 +2479,41 @@ bool StitchCPUAnalysis::propagateFromRootsToProducers() {
           }
           ++inIdx;
         }
+        parallelPlan_[in].insert(inInfo.id);
+        inId = inInfo.id;
+      }
+      auto lastWriter = fusionPattern_.findLastWriter(in);
+      if (isTargetOp(lastWriter)) {
+        toProcessIds.emplace_back(lastWriter, inId);
+      }
+    } else if (isa<lmhlo::ReshapeOp, lmhlo::DynamicReshapeOp>(op)) {
+      Value in = op->getOperand(0);
+      if (isa<lmhlo::DynamicReshapeOp>(op)) {
+        Value shapeOperand = op->getOperand(1);
+        auto& shapeInfo = makeParallelInfo(shapeOperand, id, op);
+        auto& info = parallelInfoStore_[id];
+        shapeInfo.inBound = info.inBound;
+        parallelPlan_[shapeOperand].insert(shapeInfo.id);
+      }
+      int inId;
+      if (!isExistingInputId(in, inId)) {
+        auto& inInfo = makeParallelInfo(in, id, op);
+        auto& info = parallelInfoStore_[id];
+        inInfo.inBound = info.inBound;
+        inInfo.isOwner = info.isOwner;
+
+        auto inTy = in.getType().cast<MemRefType>();
+        auto inNonSizeOneDims = getNonSizeOneDims(inTy);
+        auto outTy = out.getType().cast<MemRefType>();
+        auto outNonSizeOneDims = getNonSizeOneDims(outTy);
+        for (const auto& z : llvm::zip(inNonSizeOneDims, outNonSizeOneDims)) {
+          int inIdx, outIdx;
+          std::tie(inIdx, outIdx) = z;
+          auto it = inInfo.indices.find(inIdx);
+          if (it == inInfo.indices.end()) continue;
+          inInfo.indices[inIdx] = info.indices[outIdx];
+        }
+
         parallelPlan_[in].insert(inInfo.id);
         inId = inInfo.id;
       }
@@ -2074,10 +2576,10 @@ bool StitchCPUAnalysis::doSubRootsAnalysis() {
         int64_t totalSize = 1;
         for (auto& en : tileInfo.tileSizes) {
           int64_t tileSize = en.second;
-          if (tileSize == ShapedType::kDynamicSize) {
+          if (tileSize == ShapedType::kDynamic) {
             tileSize = ty.getShape()[en.first];
           }
-          if (tileSize == ShapedType::kDynamicSize) return false;
+          if (tileSize == ShapedType::kDynamic) return false;
           totalSize *= tileSize;
         }
         return totalSize == 1;
@@ -2163,7 +2665,7 @@ bool StitchCPUAnalysis::emitParallelIndices(OpBuilder& b, Location loc,
       Operation* op = to.op;
       LLVM_DEBUG(llvm::dbgs() << "  to.op = " << *op << "\n");
       assert(op);
-      if (isa<lmhlo::ConstOp>(op)) {
+      if (isa<lmhlo::ConstantOp>(op)) {
         // Only scalar const is fusible, and it should have no parallel indices.
         assert(to.indices.empty());
         to.symbolInBound = trueValue;
@@ -2186,6 +2688,12 @@ bool StitchCPUAnalysis::emitParallelIndices(OpBuilder& b, Location loc,
           LLVM_DEBUG(llvm::dbgs() << "failed to emitBcastOpParallelIndex\n");
           return false;
         }
+      } else if (isa<lmhlo::ReshapeOp, lmhlo::DynamicReshapeOp>(op)) {
+        if (!emitReshapeOpParallelIndex(b, loc, from, to)) {
+          LLVM_DEBUG(llvm::dbgs() << "failed to emitBcastOpParallelIndex\n");
+          return false;
+        }
+
       } else {
         // failure due to unknown ops
         LLVM_DEBUG(llvm::dbgs() << "unknown op\n");
@@ -2315,6 +2823,55 @@ bool StitchCPUAnalysis::emitBcastOpParallelIndex(OpBuilder& b, Location loc,
   return true;
 }
 
+bool StitchCPUAnalysis::emitReshapeOpParallelIndex(OpBuilder& b, Location loc,
+                                                   ParallelInfo& from,
+                                                   ParallelInfo& to) {
+  Operation* op = to.op;
+  assert(op);
+  Value in = op->getOperand(0);
+  Value out = cast<lmhlo::LmhloOp>(op).getResultBuffer();
+
+  if (from.value != in && from.value != out) {
+    LLVM_DEBUG(llvm::dbgs() << "from.value: " << from.value << "\n");
+    LLVM_DEBUG(
+        llvm::dbgs()
+        << "shape input of reshape op should not have parallel indices\n");
+    return false;
+  }
+
+  if (to.value != in && to.value != out) {
+    // to is the target shape operand
+    assert(to.indices.empty());
+    Value trueValue = b.create<arith::ConstantIntOp>(loc, 1, 1);
+    to.symbolInBound = trueValue;
+    to.symbolIsOwner = allIndicesZeros(b, loc, from.symbolIndices);
+    return true;
+  }
+
+  to.symbolInBound = from.symbolInBound;
+  to.symbolIsOwner = from.symbolIsOwner;
+
+  auto fromTy = from.value.getType().cast<MemRefType>();
+  SmallVector<Value> fromNonSizeOneIndices;
+  for (const auto& en : llvm::enumerate(from.getSortedParallelAxes())) {
+    if (fromTy.getShape()[en.value()] == 1) continue;
+    fromNonSizeOneIndices.push_back(from.symbolIndices[en.index()]);
+  }
+
+  int numNonSizeOneDim = 0;
+  Value zero = b.create<arith::ConstantIndexOp>(loc, 0);
+  auto toTy = to.value.getType().cast<MemRefType>();
+  for (const auto& en : llvm::enumerate(to.getSortedParallelAxes())) {
+    if (toTy.getShape()[en.value()] == 1) {
+      to.symbolIndices.push_back(zero);
+    } else {
+      to.symbolIndices.push_back(fromNonSizeOneIndices[numNonSizeOneDim++]);
+    }
+  }
+
+  return true;
+}
+
 using ValueViewStore = DenseMap<SmallVector<Value>, Value>;
 using ViewStore = DenseMap<Value, ValueViewStore>;
 
@@ -2328,9 +2885,15 @@ bool StitchCPUAnalysis::emitInOutTiles(OpBuilder& b, Location loc,
                 fusionPattern_.getOperands().end());
   inOuts.insert(inOuts.end(), fusionPattern_.getResults().begin(),
                 fusionPattern_.getResults().end());
+  SymbolicDimMgr* mgr = nullptr;
+  if (auto shapeIRAnalysis =
+          dynamic_cast<ShapeConstraintIRAnalysis*>(&shapeAnalysis_)) {
+    mgr = &shapeIRAnalysis->symbolicDimMgr();
+  }
   for (Value in : inOuts) {
     auto& valueViewStore = viewStore[in];
     auto& tileInfo = tilePlan_[in];
+    auto inSymbols = getMemRefValueSymbolicDimRefs(in);
     for (int id : parallelPlan_[in]) {
       auto& parallelInfo = parallelInfoStore_[id];
       auto& indices = parallelInfo.symbolIndices;
@@ -2351,9 +2914,11 @@ bool StitchCPUAnalysis::emitInOutTiles(OpBuilder& b, Location loc,
       // logic can be simplified to:
       //   %inputView = input[i][j][0:n][0:m] : memref<1x1x?x?xf32>
 
+      bool staticShape = true;
       SmallVector<OpFoldResult> subViewSizes;
       SmallVector<OpFoldResult> subViewOffsets;
       SmallVector<OpFoldResult> subViewSteps;
+      SmallVector<SymbolicDimOp> subViewSymbols;
       int parallelIdx = 0;
       for (int d = 0; d < rank; ++d) {
         subViewSteps.push_back(getIntAttr(1));
@@ -2363,26 +2928,48 @@ bool StitchCPUAnalysis::emitInOutTiles(OpBuilder& b, Location loc,
           auto& parallelIndex = parallelIndexStore_[parallelIt->second];
           subViewSizes.push_back(getIntAttr(parallelIndex.step));
           subViewOffsets.push_back(parallelInfo.symbolIndices[parallelIdx]);
+          if (inSymbols.has_value() && mgr) {
+            subViewSymbols.push_back(
+                mgr->newConstantSymbolicDim(parallelIndex.step));
+          }
           ++parallelIdx;
         } else if (tileIt != tileInfo.tileSizes.end()) {
           subViewOffsets.push_back(getIntAttr(0));
-          if (tileIt->second == ShapedType::kDynamicSize) {
-            if (inType.getShape()[d] == ShapedType::kDynamicSize) {
+          if (tileIt->second == ShapedType::kDynamic) {
+            if (inType.getShape()[d] == ShapedType::kDynamic) {
               Value dimSize = b.create<memref::DimOp>(loc, in, d);
               subViewSizes.push_back(dimSize);
+              if (inSymbols.has_value() && mgr) {
+                subViewSymbols.push_back(
+                    mgr->symbolTable().lookup<SymbolicDimOp>(
+                        (*inSymbols)[d].getValue()));
+                staticShape = false;
+              }
             } else {
               subViewSizes.push_back(getIntAttr(inType.getShape()[d]));
+              if (inSymbols.has_value() && mgr) {
+                subViewSymbols.push_back(
+                    mgr->newConstantSymbolicDim(inType.getShape()[d]));
+              }
             }
           } else {
             subViewSizes.push_back(getIntAttr(tileIt->second));
+            if (inSymbols.has_value() && mgr) {
+              subViewSymbols.push_back(
+                  mgr->newConstantSymbolicDim(tileIt->second));
+            }
           }
         } else {
           assert(false && "unexpected situation\n");
           return false;
         }
       }
-      valueViewStore[indices] = b.create<memref::SubViewOp>(
-          loc, in, subViewOffsets, subViewSizes, subViewSteps);
+      auto view = b.create<memref::SubViewOp>(loc, in, subViewOffsets,
+                                              subViewSizes, subViewSteps);
+      if (inSymbols.has_value() && mgr && !staticShape) {
+        attachSymbolicDimOpRefArrayAttrOnOperation(view, subViewSymbols);
+      }
+      valueViewStore[indices] = view.getResult();
     }
   }
   return true;
@@ -2397,29 +2984,52 @@ Value StitchCPUAnalysis::emitTileBuffer(OpBuilder& b, Location loc, Value val) {
     int64_t totalSize = 1;
     for (auto& en : tileInfo.tileSizes) {
       int64_t tileSize = en.second;
-      if (tileSize == ShapedType::kDynamicSize) {
+      if (tileSize == ShapedType::kDynamic) {
         tileSize = ty.getShape()[en.first];
       }
-      if (tileSize == ShapedType::kDynamicSize) return false;
+      if (tileSize == ShapedType::kDynamic) return false;
       totalSize *= tileSize;
     }
     return totalSize < 64;
   }();
 
+  bool staticShape = true;
+  SymbolicDimMgr* mgr = nullptr;
+  if (auto shapeIRAnalysis =
+          dynamic_cast<ShapeConstraintIRAnalysis*>(&shapeAnalysis_)) {
+    mgr = &shapeIRAnalysis->symbolicDimMgr();
+  }
+  auto valSymbols = getMemRefValueSymbolicDimRefs(val);
   SmallVector<int64_t> newTyShape;
   SmallVector<Value> dynDims;
+  SmallVector<SymbolicDimOp> tileSymbols;
   for (int d = 0; d < ty.getRank(); ++d) {
     auto it = tileInfo.tileSizes.find(d);
     if (it == tileInfo.tileSizes.end()) {
       newTyShape.push_back(1);
+      if (mgr && valSymbols.has_value()) {
+        tileSymbols.push_back(mgr->newConstantSymbolicDim(1));
+      }
       continue;
     }
-    if (it->second != ShapedType::kDynamicSize) {
+    if (it->second != ShapedType::kDynamic) {
       newTyShape.push_back(it->second);
+      if (mgr && valSymbols.has_value()) {
+        tileSymbols.push_back(mgr->newConstantSymbolicDim(it->second));
+      }
       continue;
     }
-    if (ty.getShape()[d] == ShapedType::kDynamicSize) {
+    if (ty.getShape()[d] == ShapedType::kDynamic) {
       dynDims.push_back(b.create<memref::DimOp>(loc, val, d));
+      if (mgr && valSymbols.has_value()) {
+        tileSymbols.push_back(mgr->symbolTable().lookup<SymbolicDimOp>(
+            (*valSymbols)[d].getValue()));
+        staticShape = false;
+      }
+    } else {
+      if (mgr && valSymbols.has_value()) {
+        tileSymbols.push_back(mgr->newConstantSymbolicDim(ty.getShape()[d]));
+      }
     }
     newTyShape.push_back(ty.getShape()[d]);
   }
@@ -2435,6 +3045,10 @@ Value StitchCPUAnalysis::emitTileBuffer(OpBuilder& b, Location loc, Value val) {
       tileBuffer = b.create<memref::AllocaOp>(loc, newTy, dynDims);
     } else {
       tileBuffer = b.create<memref::AllocOp>(loc, newTy, dynDims);
+    }
+    if (mgr && valSymbols.has_value() && !staticShape) {
+      attachSymbolicDimOpRefArrayAttrOnOperation(tileBuffer.getDefiningOp(),
+                                                 tileSymbols);
     }
   }
 
@@ -2611,7 +3225,7 @@ bool StitchCPUAnalysis::emitAllSubRootsAndRootsCalculation(OpBuilder& b,
       auto& info = parallelInfoStore_[id];
       inBound = b.create<arith::OrIOp>(loc, inBound, info.symbolInBound);
     }
-    auto ifOp = b.create<scf::IfOp>(loc, llvm::None, inBound, false);
+    auto ifOp = b.create<scf::IfOp>(loc, TypeRange{}, inBound, false);
 
     // emit sub-root calculation logic
     auto fusionOp = op->getParentOfType<lmhlo::FusionOp>();
@@ -2648,7 +3262,7 @@ bool StitchCPUAnalysis::emitAllSubRootsAndRootsCalculation(OpBuilder& b,
                  << "failed to do emitSubRootCalculation for " << *op << "\n");
       return false;
     }
-    Block& block = subFusionOp.region().front();
+    Block& block = subFusionOp.getRegion().front();
     block.clear();
     for (Operation* clonedOp : llvm::reverse(clonedLmhloOps)) {
       clonedOp->moveBefore(&block, block.begin());
@@ -2666,7 +3280,7 @@ bool StitchCPUAnalysis::emitAllSubRootsAndRootsCalculation(OpBuilder& b,
       isOwner =
           innerBuilder.create<arith::OrIOp>(loc, isOwner, info.symbolIsOwner);
     }
-    ifOp = innerBuilder.create<scf::IfOp>(loc, llvm::None, isOwner, true);
+    ifOp = innerBuilder.create<scf::IfOp>(loc, TypeRange{}, isOwner, true);
     Block* elseBlock = &ifOp.getElseRegion().getBlocks().front();
     subFusionOp->moveBefore(elseBlock, elseBlock->begin());
 
@@ -2680,7 +3294,7 @@ bool StitchCPUAnalysis::emitAllSubRootsAndRootsCalculation(OpBuilder& b,
       return false;
     }
     Operation& tileResultOp =
-        *++llvm::reverse(clonedSubFusionOp.region().front()).begin();
+        *++llvm::reverse(clonedSubFusionOp.getRegion().front()).begin();
     innerBuilder.setInsertionPointAfter(&tileResultOp);
     innerBuilder.create<lmhlo::CopyOp>(loc, tileResultOp.getOperands().back(),
                                        it->second);
@@ -2753,13 +3367,13 @@ bool StitchCPUAnalysis::emitAllSubRootsAndRootsCalculation(OpBuilder& b,
 //  ```
 bool StitchCPUAnalysis::doCodeGeneration(OpBuilder& b, lmhlo::FusionOp fusion) {
   LLVM_DEBUG(llvm::dbgs() << "Try to doCodeGeneration for fusion:\n" << fusion);
-  if (!isStitchFusion(fusion)) return false;
+  if (!isFusionType<FusionType::kStitch>(fusion)) return false;
   if (!fusibilityAnalysis()) return false;
 
   // 1, create parallel for loop according to dominant value parallel info.
   b.setInsertionPoint(fusion);
   auto cloned = cast<FusionOp>(b.clone(*fusion.getOperation()));
-  Block& block = cloned.region().front();
+  Block& block = cloned.getRegion().front();
   SmallVector<Operation*> toRemove;
   for (Operation& op : block) {
     if (!isa<lmhlo::TerminatorOp>(&op)) toRemove.push_back(&op);

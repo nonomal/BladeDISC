@@ -16,22 +16,23 @@ limitations under the License.
 // This file implements the logic to create a parallel schedule for parallel ops
 // on the cpu device.
 
+#include "lhlo/IR/lhlo_ops.h"
 #include "llvm/Support/Debug.h"
-#include "mlir-hlo/Dialect/lhlo/IR/lhlo_ops.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
-#include "mlir/Dialect/SCF/SCF.h"
-#include "mlir/IR/BlockAndValueMapping.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Location.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/Passes.h"
 #include "mlir/Transforms/RegionUtils.h"
-#include "tensorflow/compiler/mlir/disc/IR/disc_ral_ops.h"
-#include "tensorflow/compiler/mlir/disc/transforms/PassDetail.h"
-#include "tensorflow/compiler/mlir/disc/transforms/codegen_utils.h"
-#include "tensorflow/compiler/mlir/disc/transforms/fusion_utils.h"
-#include "tensorflow/compiler/mlir/disc/transforms/placement_utils.h"
+#include "mlir/disc/IR/disc_ral_ops.h"
+#include "mlir/disc/transforms/PassDetail.h"
+#include "mlir/disc/transforms/codegen_utils.h"
+#include "mlir/disc/transforms/fusion_utils.h"
+#include "mlir/disc/transforms/placement_utils.h"
 
 namespace mlir {
 namespace disc_ral {
@@ -134,7 +135,7 @@ LogicalResult tileInnerMostParallelAxis(OpBuilder& b, scf::ParallelOp op) {
 struct DiscCpuMapParallelLoop
     : DiscCpuMapParallelLoopBase<DiscCpuMapParallelLoop> {
   void runOnOperation() override {
-    FuncOp func = getOperation();
+    func::FuncOp func = getOperation();
     SmallVector<scf::ParallelOp> candidates;
     func.walk([&](scf::ParallelOp op) {
       if (op->getParentOfType<scf::ParallelOp>()) return;
@@ -166,7 +167,8 @@ LogicalResult DiscCpuMapParallelLoop::processParallelOp(scf::ParallelOp op) {
 
 }  // namespace
 
-std::unique_ptr<OperationPass<FuncOp>> createDiscCpuMapParallelLoopPass() {
+std::unique_ptr<OperationPass<func::FuncOp>>
+createDiscCpuMapParallelLoopPass() {
   return std::make_unique<DiscCpuMapParallelLoop>();
 }
 

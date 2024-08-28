@@ -13,6 +13,12 @@ def nvcc_bin_path():
 def blade_gemm_nvcc():
     return "%{BLADE_GEMM_NVCC}"
 
+def blade_gemm_tvm():
+    return "%{BLADE_GEMM_TVM}"
+
+def blade_gemm_rocm_path():
+    return "%{BLADE_GEMM_ROCM_PATH}"
+
 def blade_gemm_nvcc_archs():
     return "%{BLADE_GEMM_NVCC_ARCHS}"
 
@@ -24,6 +30,9 @@ def cuda_home():
 
 def cuda_version():
     return "%{CUDA_VERSION}"
+
+def disc_target_cpu_arch():
+    return "%{DISC_TARGET_CPU_ARCH}"
 
 def if_hie_enabled(if_true, if_false = []):
     if %{IF_HIE}:
@@ -42,11 +51,6 @@ def if_tensorrt_enabled(if_true, if_false = []):
 
 def if_tensorrt_disabled(if_true, if_false = []):
     if not %{TENSORRT_ENABLED}:
-        return if_true
-    return if_false
-
-def if_internal(if_true, if_false = []):
-    if %{IF_INTERNAL}:
         return if_true
     return if_false
 
@@ -83,5 +87,14 @@ def if_disc_aarch64(if_true, if_false=[]):
 def if_platform_alibaba(if_true, if_false=[]):
     return select({
         "@local_config_blade_disc_helper//:is_platform_alibaba": if_true,
+        "//conditions:default": if_false
+    })
+
+def foreign_make_args():
+    return [ "-j%{DISC_FOREIGN_MAKE_JOBS}" ]
+
+def if_internal_serving(if_true, if_false=[]):
+    return select({
+        "@local_config_blade_disc_helper//:is_internal_serving": if_true,
         "//conditions:default": if_false
     })

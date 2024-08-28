@@ -17,15 +17,16 @@ limitations under the License.
 #define TENSORFLOW_COMPILER_MLIR_HLO_INCLUDE_MLIR_HLO_DIALECT_MHLO_TRANSFORMS_FUSION_UTILS_H_
 
 #include <memory>
+#include <set>
+#include <string>
 #include <vector>
 
+#include "lhlo/IR/lhlo_ops.h"
 #include "llvm/ADT/EquivalenceClasses.h"
 #include "llvm/Support/Debug.h"
-#include "mlir-hlo/Dialect/lhlo/IR/lhlo_ops.h"
-#include "mlir/Dialect/SCF/SCF.h"
-#include "mlir/Dialect/StandardOps/IR/Ops.h"  // TF:llvm-project
-#include "tensorflow/compiler/mlir/disc/transforms/lhlo_elemental_utils.h"
-#include "tensorflow/compiler/mlir/disc/transforms/shape_utils.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/disc/transforms/lhlo_elemental_utils.h"
+#include "mlir/disc/transforms/shape_utils.h"
 
 #define DEBUG_TYPE "disc-fusion-utils"
 
@@ -63,18 +64,23 @@ namespace disc_ral {
 
 DenseSet<Operation*> NoLoaderUser(SmallVectorImpl<Operation*>& ops);
 
-void cleanUnusedLhloOps(Block* parent);
+// If `rewriter` is not null, try to erase the unused ops through it.
+// Otherwise remove the unused ops directly.
+// Note that if we are inside a rewriter pattern, we have to set the `rewriter`
+// in order to notify the listeners of the rewriter.
+void cleanUnusedLhloOps(Block* parent, PatternRewriter* rewriter = nullptr);
 
 // returns the users of the `memref`. The users should be in the same fusion
 // like `op`.
 DenseSet<Operation*> getValueUsersInFusionLike(Value memref, Operation* op);
 
-bool isOnGpu(Operation* op);
+bool isInplaceOperator(Operation* op);
 
 // Attributes used to annotate the fusion type, fusion name and tags.
 constexpr const char* kDiscFusionTypeAttrName = "disc.fusion_type";
 constexpr StringRef kFusionOpNameAttr = "disc.fusion.name";
 constexpr StringRef kFusionOpTagAttr = "disc.fusion.tag";
+constexpr const char* kFusionTagSeparator = "X";
 
 // kLoop fusion template satisfies:
 //   - all ops in the fusion pattern are element-wise.
@@ -111,6 +117,14 @@ enum FusionType {
   kStitch,
   // A schedule for concat op having many operands.
   kLargeConcat,
+  // Dot fusion.
+  kDot,
+  // Where op fusion, maybe need a more general name?
+  kWhere,
+  // transform dialect based codegen fusion pattern
+  kTransform,
+  // sparse reduction fusion,
+  kSparseReduction,
 };
 
 FusionType getFusionType(Operation* op);
@@ -142,14 +156,15 @@ bool isRowReduction(Operation* op);
 // Returns true if this op is a rank-2 column reduction.
 bool isRank2ColReduction(Operation* op);
 
+// Returns true if this op is a rank-2 or rank-3 transpose
+bool isRank2or3Transpose(Operation* op);
+
 // Returns true if the op is supported by the downstreaming fusion codegen
 // engine.
 bool isFusible(Operation* op);
 
-// Returns the number of operands that are supposed to be written.
-// For some ops (e.g. lmhlo ops), some operands are the output memrefs
-// Thus these operands are supposed to be updated.
-int getNumResultOperands(Operation* op);
+// Return true if enable transpose library call
+bool enableTransposeLibraryCall();
 
 // Returns data users of the value and its aliases (e.g. memref.cast).
 // Here non-data users means DimOp, DeallocOp and ShapeOfOp.
@@ -158,14 +173,14 @@ SmallVector<Operation*, 4> getValueUsers(Value v);
 struct TileInfo {
   // Maps axis -> tile_size along this axis.
   // select all the elements along the axis if tile_size ==
-  // ShapedType::kDynamicSize
-  DenseMap<int, int> tileSizes;
+  // ShapedType::kDynamic
+  DenseMap<int64_t, int64_t> tileSizes;
 
   // Returns false if failed to merge.
   bool merge(TileInfo& other);
 
   // Returns false if failed to merge.
-  bool merge(int axis, int tileSize = ShapedType::kDynamicSize);
+  bool merge(int64_t axis, int64_t tileSize = ShapedType::kDynamic);
 
   // return true if updated.
   bool updateIfNotEqual(TileInfo& other);
@@ -185,6 +200,9 @@ class FusionPatternBase {
   // Create a new fusion pattern from the ops inside the lmhlo fusion op.
   explicit FusionPatternBase(lmhlo::FusionOp op);
 
+  // Create a new fusion pattern with the ops inside the list.
+  explicit FusionPatternBase(SmallVectorImpl<Operation*>& op_list);
+
   // Returns the op list this fusion pattern represents.
   FusionOpList& getOpList() { return op_list_; }
 
@@ -201,12 +219,15 @@ class FusionPatternBase {
   SmallVector<Operation*, 4>& getRootOps() { return root_ops_; }
 
   // Returns values that are outputs of any lmhlo op in the fused pattern and
-  // are only consumed by the lmhlo ops outside the fused pattern.
+  // are only consumed by the lmhlo ops inside the fused pattern.
   FusionValueList& getInternalResults() { return internal_results_; }
 
   // Returns values that are outputs of any lmhlo op in the fused pattern and
-  // are only consumed by the lmhlo ops inside the fused pattern.
+  // are only consumed by the lmhlo ops outside the fused pattern.
   FusionValueList& getExternalOnlyResults() { return external_only_results_; }
+
+  // Return last writer map of ops in the fusion pattern.
+  DenseMap<Value, Operation*>& getLastWriter() { return last_writer_; }
 
   // Returns the size of the ops this fusion pattern contains.
   int size() { return op_list_.size(); }
@@ -236,9 +257,16 @@ class FusionPatternBase {
     last_writer_[value] = op;
   }
 
- protected:
-  FusionPatternBase(SmallVectorImpl<Operation*>& op_list);
+  bool alreadyInRootOps(Operation* new_op) {
+    for (Operation* op : root_ops_) {
+      if (new_op == op) {
+        return true;
+      }
+    }
+    return false;
+  }
 
+ protected:
   // Calculates the inputs and outputs of the fusion pattern.
   void calculateOperandsAndResults();
 
@@ -313,9 +341,17 @@ class FusionPattern : public FusionPatternBase {
   // Returns true if the fusion type is stitch fusion.
   bool isStitchFusion() { return getFusionType() == FusionType::kStitch; }
 
+  // Returns true if the fusion type is transform-based fusion.
+  bool isTransformBasedFusion() {
+    return getFusionType() == FusionType::kTransform;
+  }
+
   // Merges two fusion patterns and returns the merged pattern. The original
   // pattern remains unmodified. The new merged pattern is uninitialized.
   FusionPattern mergeWithoutInit(FusionPattern& other);
+
+  // Create a new fusion pattern with the given op list, without init.
+  static FusionPattern createWithoutInit(SmallVectorImpl<Operation*>& op_list);
 
   DenseMap<Value, TileInfo>& getTilePlan() { return tile_plan_; }
   void setTilePlan(const DenseMap<Value, TileInfo>& tile_plan) {
@@ -329,7 +365,7 @@ class FusionPattern : public FusionPatternBase {
   }
 
   struct SkeletonGroup {
-    Operation* skeleton;
+    SmallVector<Operation*> skeletons;
     SmallVector<Operation*> root_member_list;
     // An irregular member means whose non-tiled dims are not exactly matched
     // with skeleton. This requires special designe for GPU block mapping when
@@ -337,15 +373,21 @@ class FusionPattern : public FusionPatternBase {
     DenseSet<Operation*> irregular_root_member_set;
   };
 
-  void findOpsOfSkeletonGroup(SkeletonGroup group, DenseSet<Operation*>& ops);
+  void findOpsOfSkeletonGroup(
+      SkeletonGroup group, DenseSet<Operation*>& ops,
+      DenseSet<Operation*>& shmem_cached_ops,
+      const DenseMap<Operation*, SmallVector<Operation*>>& existing_group_ops,
+      int row_per_block, int& shmem_usage_bits, const int shmem_limit_bits);
+
+  int64_t getCollapsedTileDim(Value value);
 
   DenseSet<Operation*>& getRegularXroots() { return regular_xroots_; }
 
   DenseSet<Operation*>& getIrregularXroots() { return irregular_xroots_; }
 
  private:
-  // Deprecated. Remove in the future.
-  FusionPattern(SmallVectorImpl<Operation*>& op_list);
+  // Create a new fusion pattern with the ops inside the list.
+  explicit FusionPattern(SmallVectorImpl<Operation*>& op_list);
 
   Operation* dominant_op_ = nullptr;
   FusionType fusion_type_ = FusionType::kNone;
@@ -360,10 +402,22 @@ class FusionPattern : public FusionPatternBase {
 
 void dumpFusionPattern(FusionPattern& pattern);
 
+// Returns true if the FusionPattern type is in {kWhere, kSparseReduction}.
+bool isSparseFusion(FusionPattern& pattern);
+
+// The basic approch to init fusion pattern.
+bool initFusionPatternBase(ShapeAnalysis& shapeAnalysis,
+                           FusionPattern& fusion_pattern);
+
 // Get skeleton-groups in which the op orders are the same with op list in the
 // given fusion pattern.
 bool getOrderedSkeletonGroups(
     FusionPattern& pattern, SmallVector<FusionPattern::SkeletonGroup>& groups);
+
+// Merge skeleton-ops that are not producer-consumer relationship together.
+bool mergeSkeletonGroupsInOrder(
+    FusionPattern& pattern, SmallVector<FusionPattern::SkeletonGroup>& groups,
+    ShapeAnalysis* shape_analysis);
 
 void dumpTilePlan(DenseMap<Value, TileInfo>& tilePlan);
 
@@ -379,6 +433,19 @@ void setFusionName(OpBuilder& b, lmhlo::FusionOp op, StringRef name);
 // Attaches a new tag to the fusion op.
 // Here different tags is mapping to different variants of the fusion op.
 void addFusionTag(OpBuilder& b, lmhlo::FusionOp op, StringRef tag);
+
+// Merge the tags of the op and `tagSet`, assign the new tag set to `op`.
+void mergeFusionTag(OpBuilder& b, lmhlo::FusionOp op,
+                    const std::set<std::string>& tagSet);
+
+// Returns the tag string attached to the fusion op.
+StringRef getFusionTagStr(lmhlo::FusionOp op);
+
+// Returns the unified tag string for the whole tagSet.
+std::string fusionTagSetToStr(const std::set<std::string>& tagSet);
+
+// Returns the parsed tag set from `tagStr`.
+std::set<std::string> parsefusionTagSetFromStr(StringRef tagStr);
 
 // Returns the full name of the fusion op
 // Here full name is composed of the name and tag of the fusion op.
@@ -422,9 +489,12 @@ class FusionStrategy {
   FusionStrategy(const FusionOptions& options) : options_(options) {}
 
   virtual bool isFusible(Operation* op);
-  virtual bool isFusible(FusionPattern& fused_pattern);
+  virtual bool isFusible(FusionPattern& fusion_pattern);
   virtual bool initFusionPattern(ShapeAnalysis& shapeAnalysis,
-                                 FusionPattern& fused_pattern) = 0;
+                                 FusionPattern& fusion_pattern) = 0;
+  virtual bool pruneFusionPattern(ShapeAnalysis& shapeAnalysis,
+                                  FusionPattern& fusion_pattern,
+                                  SmallVectorImpl<Operation*>& excluded_ops);
   virtual bool tryFuseInplace(ShapeAnalysis& shapeAnalysis, FusionPattern& lhs,
                               FusionPattern& rhs);
   virtual bool tryFuse(ShapeAnalysis& shapeAnalysis, FusionPattern& lhs,
@@ -433,6 +503,46 @@ class FusionStrategy {
 
  protected:
   FusionOptions options_;
+};
+
+using DeviceStrategyMap = DenseMap<StringRef, FusionStrategy*>;
+
+class PlacementAwareFusionStrategy : public FusionStrategy {
+ public:
+  PlacementAwareFusionStrategy(const FusionOptions& options,
+                               StringRef defaultDevice,
+                               DeviceStrategyMap deviceStrategyMap)
+      : FusionStrategy(options),
+        deviceStrategyMap_(std::move(deviceStrategyMap)),
+        defaultDevice_(defaultDevice) {}
+
+  bool isFusible(Operation* op) override;
+  bool isFusible(FusionPattern& fusion_pattern) override;
+  bool tryFuse(ShapeAnalysis& shapeAnalysis, FusionPattern& lhs,
+               FusionPattern& rhs, FusionPattern& target) override;
+  bool initFusionPattern(ShapeAnalysis& shapeAnalysis,
+                         FusionPattern& fusion_pattern) override;
+  virtual bool pruneFusionPattern(
+      ShapeAnalysis& shapeAnalysis, FusionPattern& fusion_pattern,
+      SmallVectorImpl<Operation*>& excluded_ops) override;
+  virtual StringRef getName() override {
+    return "PlacementAwareFusionStrategy";
+  }
+  DeviceStrategyMap getStrategyMap() { return deviceStrategyMap_; }
+
+ private:
+  StringRef getPlacement(Operation* op);
+  StringRef getPlacement(FusionPattern& fusion_pattern);
+  FusionStrategy* getStrategy(StringRef placement);
+  FusionStrategy* getStrategy(Operation* op) {
+    return getStrategy(getPlacement(op));
+  }
+  FusionStrategy* getStrategy(FusionPattern& fusion_pattern) {
+    return getStrategy(getPlacement(fusion_pattern));
+  }
+
+  StringRef defaultDevice_;
+  DeviceStrategyMap deviceStrategyMap_;
 };
 
 // Creates and returns a new placement-aware fusion strategy.
@@ -454,6 +564,11 @@ struct ParallelIndex {
   //    - dim 0, step 1
   //    - dim 2, step 4
   int64_t step = 1;
+
+  // The actual index value at compile time.
+  // unknown if it's ShapedType::kDynamic, otherwise it's a constant
+  // parallel index.
+  int64_t value = ShapedType::kDynamic;
 };
 
 // Represents the parallel info for a buffer.
@@ -488,12 +603,21 @@ struct ParallelInfo {
 
   // whether this parallel info is needed by any root.
   bool consumedByRoots = false;
+
+  // Returns the sorted parallel axes.
+  SmallVector<int> getSortedParallelAxes() {
+    SmallVector<int> parallelAxes;
+    for (auto&& e : indices) parallelAxes.push_back(e.first);
+    llvm::sort(parallelAxes);
+    return parallelAxes;
+  }
 };
 
 class StitchCPUAnalysis {
  public:
-  explicit StitchCPUAnalysis(FusionPattern& fusionPattern)
-      : fusionPattern_(fusionPattern) {}
+  explicit StitchCPUAnalysis(FusionPattern& fusionPattern,
+                             ShapeAnalysis& shapeAnalysis)
+      : fusionPattern_(fusionPattern), shapeAnalysis_(shapeAnalysis) {}
 
   // Returns true if the fusion pattern is a valid stitch pattern.
   bool fusibilityAnalysis();
@@ -524,6 +648,8 @@ class StitchCPUAnalysis {
                               Operation* op, bool& changed);
   bool doBcastOpTileAnalysis(DenseMap<Value, TileInfo>& tilePlan, Operation* op,
                              bool& changed);
+  bool doReshapeOpTileAnalysis(DenseMap<Value, TileInfo>& tilePlan,
+                               Operation* op, bool& changed);
 
   // Returns a unique id per instance.
   int newSymbolId() { return nextSymbolId_++; }
@@ -532,7 +658,8 @@ class StitchCPUAnalysis {
   // buffers.
   bool doParallelAnalysis();
   // Creates a new parallel index.
-  ParallelIndex& makeParallelIndex(int64_t step = 1);
+  ParallelIndex& makeParallelIndex(int64_t step = 1,
+                                   int64_t value = ShapedType::kDynamic);
   // Creates a new parallel info.
   ParallelInfo& makeParallelInfo(Value value, int producerId = 0,
                                  Operation* op = nullptr);
@@ -576,6 +703,8 @@ class StitchCPUAnalysis {
                                  ParallelInfo& to);
   bool emitBcastOpParallelIndex(OpBuilder& b, Location loc, ParallelInfo& from,
                                 ParallelInfo& to);
+  bool emitReshapeOpParallelIndex(OpBuilder& b, Location loc,
+                                  ParallelInfo& from, ParallelInfo& to);
   // used for emitting in/out subviews
   bool emitInOutTiles(OpBuilder& b, Location loc, ViewStore& viewStore);
   // used for emitting sub root tile buffers
@@ -593,6 +722,7 @@ class StitchCPUAnalysis {
 
  private:
   FusionPattern& fusionPattern_;
+  ShapeAnalysis& shapeAnalysis_;
 
   // Used for roots dominant analysis
   Value dominantValue_;
@@ -605,6 +735,8 @@ class StitchCPUAnalysis {
   int nextSymbolId_ = 0;
   // map parallel index id -> parallel index instance
   DenseMap<int, ParallelIndex> parallelIndexStore_;
+  // map a constant value to the id of the corresponding const parallel index.
+  DenseMap<int64_t, int> constParallelIndexStore_;
   // map parallel info id -> parallel info instance
   DenseMap<int, ParallelInfo> parallelInfoStore_;
   // map buffer value to the ids of its parallel info instances.
@@ -619,33 +751,153 @@ class StitchCPUAnalysis {
   Operation* parallelOp_;
 };
 
-bool isStitchFusion(Operation* op);
+template <FusionType... Types>
+bool isFusionType(Operation* op) {
+  SmallVector<FusionType, 2> fusionTypes({Types...});
+  FusionType fusionType = FusionType::kNone;
+  auto fusionTypeAttr = op->getAttrOfType<StringAttr>(kDiscFusionTypeAttrName);
+  if (fusionTypeAttr) {
+    fusionType = fusionTypeFromString(fusionTypeAttr.getValue());
+  }
+  return llvm::find(fusionTypes, fusionType) != fusionTypes.end();
+}
+
+class BaseFusionStrategy : public FusionStrategy {
+ public:
+  using FusionStrategy::FusionStrategy;
+
+  using FusionStrategy::isFusible;
+  bool isFusible(FusionPattern& fusion_pattern) override;
+  bool tryFuse(ShapeAnalysis& shapeAnalysis, FusionPattern& lhs,
+               FusionPattern& rhs, FusionPattern& target) override;
+  bool initFusionPattern(ShapeAnalysis& shapeAnalysis,
+                         FusionPattern& fusion_pattern) override;
+  virtual StringRef getName() override { return "BaseFusionStrategy"; }
+
+ protected:
+  virtual Value getEffectiveShape(FusionPattern& target, Value value) = 0;
+  virtual bool checkSameShape(FusionPattern& lhs, FusionPattern& rhs,
+                              FusionPattern& target) {
+    return false;
+  }
+};
+
+class BaseGpuFusionStrategy : public BaseFusionStrategy {
+ public:
+  using BaseFusionStrategy::BaseFusionStrategy;
+
+  bool isFusible(Operation* op) override;
+  bool checkSameShape(FusionPattern& lhs, FusionPattern& rhs,
+                      FusionPattern& target) {
+    return lhs.isKInputFusion() && rhs.isKInputFusion();
+  }
+  virtual bool tryFuse(ShapeAnalysis& shapeAnalysis, FusionPattern& lhs,
+                       FusionPattern& rhs, FusionPattern& target) override;
+  Value getEffectiveShape(FusionPattern& target, Value v) override;
+  virtual StringRef getName() override { return "BaseGpuFusionStrategy"; }
+};
 
 class StitchGpuFusionStrategy : public FusionStrategy {
  public:
   StitchGpuFusionStrategy(const FusionOptions& options)
       : FusionStrategy(options) {}
-
+  virtual bool isFusible(Operation* op) override;
+  virtual bool tryFuse(ShapeAnalysis& shapeAnalysis, FusionPattern& lhs,
+                       FusionPattern& rhs, FusionPattern& target) override;
   virtual bool initFusionPattern(ShapeAnalysis& shapeAnalysis,
-                                 FusionPattern& fused_pattern) override;
+                                 FusionPattern& fusion_pattern) override;
   virtual StringRef getName() override { return "StitchGpuFusionStrategy"; }
 
  private:
   virtual Value getEffectiveShape(FusionPattern& target, Value value);
 
-  bool tileInfoPropagateI2O(
-      ShapeAnalysis& shapeAnalysis, DenseMap<Value, TileInfo>& tile_plan,
-      Operation* op, int64_t input_index,
-      SmallVector<std::pair<Value, TileInfo>, 4>& out_info);
   bool tileCoverInfoPropagateO2I(
       ShapeAnalysis& shapeAnalysis, DenseMap<Value, TileInfo>& tile_plan,
       Operation* op, SmallVector<std::pair<Value, TileInfo>, 4>& in_info,
       bool& cover);
   bool findFusionPatternTypeAndSubroot(ShapeAnalysis& shapeAnalysis,
-                                       FusionPattern& fused_pattern);
+                                       FusionPattern& fusion_pattern);
   bool tileXroots(ShapeAnalysis& shapeAnalysis, FusionPattern& fusion_pattern);
   bool backtraceTileAndCover(ShapeAnalysis& shapeAnalysis,
                              FusionPattern& fusion_pattern, Value value);
+};
+
+class PreDotGpuFusionStrategy : public BaseFusionStrategy {
+ public:
+  using BaseFusionStrategy::BaseFusionStrategy;
+
+  virtual bool isFusible(Operation* op) override;
+  Value getEffectiveShape(FusionPattern& target, Value v) override;
+
+  virtual StringRef getName() override { return "PreDotGpuFusionStrategy"; }
+};
+
+class DotGpuFusionStrategy : public FusionStrategy {
+ public:
+  DotGpuFusionStrategy(const FusionOptions& options)
+      : FusionStrategy(options) {}
+
+  virtual bool isFusible(Operation* op) override;
+  virtual bool isFusible(FusionPattern& fusion_pattern) override;
+  virtual bool initFusionPattern(ShapeAnalysis& shapeAnalysis,
+                                 FusionPattern& fusion_pattern) override;
+  virtual bool pruneFusionPattern(
+      ShapeAnalysis& shapeAnalysis, FusionPattern& fusion_pattern,
+      SmallVectorImpl<Operation*>& excluded_ops) override;
+
+  virtual bool tryFuse(ShapeAnalysis& shapeAnalysis, FusionPattern& lhs,
+                       FusionPattern& rhs, FusionPattern& target) override;
+
+  virtual StringRef getName() override { return "DotGpuFusionStrategy"; }
+
+ private:
+  SmallVector<Value> getEffectiveOperands(Operation* op);
+};
+
+class TransformBasedCpuFusionStrategy : public FusionStrategy {
+ public:
+  TransformBasedCpuFusionStrategy(const FusionOptions& options)
+      : FusionStrategy(options) {}
+
+  virtual bool isFusible(Operation* op) override;
+  virtual bool initFusionPattern(ShapeAnalysis& shapeAnalysis,
+                                 FusionPattern& fused_pattern) override;
+  virtual bool tryFuse(ShapeAnalysis& shapeAnalysis, FusionPattern& lhs,
+                       FusionPattern& rhs, FusionPattern& target) override;
+
+  virtual StringRef getName() override {
+    return "TransformBasedCpuFusionStrategy";
+  }
+};
+
+class SparseOpCpuFusionStrategy : public FusionStrategy {
+ public:
+  SparseOpCpuFusionStrategy(const FusionOptions& options)
+      : FusionStrategy(options) {}
+
+  virtual bool isFusible(Operation* op) override;
+  virtual bool initFusionPattern(ShapeAnalysis& shapeAnalysis,
+                                 FusionPattern& fused_pattern) override;
+  virtual bool tryFuse(ShapeAnalysis& shapeAnalysis, FusionPattern& lhs,
+                       FusionPattern& rhs, FusionPattern& target) override;
+
+  virtual StringRef getName() override { return "SparseOpCpuFusionStrategy"; }
+};
+
+class TransformBasedGpuFusionStrategy : public FusionStrategy {
+ public:
+  TransformBasedGpuFusionStrategy(const FusionOptions& options)
+      : FusionStrategy(options) {}
+
+  virtual bool isFusible(Operation* op) override;
+  virtual bool initFusionPattern(ShapeAnalysis& shapeAnalysis,
+                                 FusionPattern& fused_pattern) override;
+  virtual bool tryFuse(ShapeAnalysis& shapeAnalysis, FusionPattern& lhs,
+                       FusionPattern& rhs, FusionPattern& target) override;
+
+  virtual StringRef getName() override {
+    return "TransformBasedGpuFusionStrategy";
+  }
 };
 
 }  // namespace disc_ral

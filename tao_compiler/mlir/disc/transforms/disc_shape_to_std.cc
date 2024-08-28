@@ -13,9 +13,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Shape/IR/Shape.h"
-#include "mlir/Dialect/StandardOps/IR/Ops.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Attributes.h"
 #include "mlir/IR/Builders.h"
@@ -28,9 +29,9 @@ limitations under the License.
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
-#include "tensorflow/compiler/mlir/disc/IR/disc_shape_ops.h"
-#include "tensorflow/compiler/mlir/disc/transforms/PassDetail.h"
-#include "tensorflow/compiler/mlir/disc/transforms/rewriters.h"
+#include "mlir/disc/IR/disc_shape_ops.h"
+#include "mlir/disc/transforms/PassDetail.h"
+#include "mlir/disc/transforms/rewriters.h"
 
 namespace mlir {
 namespace disc_ral {
@@ -116,10 +117,6 @@ class ConstShapeOpConverter : public OpConversionPattern<ConstShapeOp> {
 LogicalResult ConstShapeOpConverter::matchAndRewrite(
     ConstShapeOp op, OpAdaptor adaptor,
     ConversionPatternRewriter& rewriter) const {
-  // For now, this lowering supports only extent tensors, not `shape.shape`
-  // types.
-  if (op.getType().isa<ShapeType>()) return failure();
-
   auto loc = op.getLoc();
   SmallVector<Value, 4> extentOperands;
   for (auto extent : op.getShape()) {
@@ -377,13 +374,13 @@ LogicalResult LinearizeOpConversion::matchAndRewrite(
     LinearizeOp op, OpAdaptor adaptor,
     ConversionPatternRewriter& rewriter) const {
   Location loc = op.getLoc();
-  int rank = adaptor.multiDimIndexes().size();
+  int rank = adaptor.getMultiDimIndexes().size();
   Value linear = rewriter.create<arith::ConstantIndexOp>(loc, 0);
   ;
   if (rank > 0) {
-    linear = adaptor.multiDimIndexes().front();
-    for (auto&& z : llvm::zip(adaptor.multiDimIndexes().drop_front(),
-                              adaptor.shapeDimIndexes().drop_front())) {
+    linear = adaptor.getMultiDimIndexes().front();
+    for (auto&& z : llvm::zip(adaptor.getMultiDimIndexes().drop_front(),
+                              adaptor.getShapeDimIndexes().drop_front())) {
       linear = rewriter.create<arith::AddIOp>(
           loc, rewriter.create<arith::MulIOp>(loc, linear, std::get<1>(z)),
           std::get<0>(z));
@@ -407,16 +404,16 @@ LogicalResult DelinearizeOpConversion::matchAndRewrite(
     DelinearizeOp op, OpAdaptor adaptor,
     ConversionPatternRewriter& rewriter) const {
   Location loc = op.getLoc();
-  int rank = adaptor.shapeDimIndexes().size();
+  int rank = adaptor.getShapeDimIndexes().size();
   if (rank == 0) {
     rewriter.eraseOp(op);
   } else if (rank == 1) {
-    rewriter.replaceOp(op, ValueRange{adaptor.linearIndex()});
+    rewriter.replaceOp(op, ValueRange{adaptor.getLinearIndex()});
   } else {
-    Value linear = adaptor.linearIndex();
+    Value linear = adaptor.getLinearIndex();
     SmallVector<Value> multiDims(rank);
-    for (auto&& en : llvm::enumerate(
-             llvm::reverse(adaptor.shapeDimIndexes().drop_front()))) {
+    for (const auto&& en : llvm::enumerate(
+             llvm::reverse(adaptor.getShapeDimIndexes().drop_front()))) {
       multiDims[rank - 1 - en.index()] =
           rewriter.create<arith::RemUIOp>(loc, linear, en.value());
       linear = rewriter.create<arith::DivUIOp>(loc, linear, en.value());
@@ -436,9 +433,8 @@ void ConvertShapeToStandardPass::runOnOperation() {
   // Setup target legality.
   MLIRContext& ctx = getContext();
   ConversionTarget target(ctx);
-  target.addLegalDialect<arith::ArithmeticDialect, StandardOpsDialect,
-                         tensor::TensorDialect>();
-  target.addLegalOp<FuncOp, ModuleOp>();
+  target.addLegalDialect<arith::ArithDialect, tensor::TensorDialect>();
+  target.addLegalOp<func::FuncOp, ModuleOp>();
 
   // Setup conversion patterns.
   RewritePatternSet patterns(&ctx);
@@ -451,14 +447,15 @@ void ConvertShapeToStandardPass::runOnOperation() {
   // clang-format: on
 
   // Apply conversion.
-  FuncOp func = getOperation();
+  func::FuncOp func = getOperation();
   if (failed(applyPartialConversion(func, target, std::move(patterns))))
     signalPassFailure();
 }
 
 }  // namespace
 
-std::unique_ptr<OperationPass<FuncOp>> createDiscConvertShapeToStandardPass() {
+std::unique_ptr<OperationPass<func::FuncOp>>
+createDiscConvertShapeToStandardPass() {
   return std::make_unique<ConvertShapeToStandardPass>();
 }
 

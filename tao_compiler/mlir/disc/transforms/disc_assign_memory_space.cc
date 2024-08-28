@@ -13,12 +13,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include "lhlo/IR/lhlo_ops.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
-#include "mlir-hlo/Dialect/lhlo/IR/lhlo_ops.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Shape/IR/Shape.h"
-#include "mlir/Dialect/StandardOps/IR/Ops.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Attributes.h"   // TF:llvm-project
 #include "mlir/IR/Location.h"     // TF:llvm-project
@@ -26,12 +27,12 @@ limitations under the License.
 #include "mlir/IR/SymbolTable.h"  // from @llvm-project
 #include "mlir/IR/TypeUtilities.h"
 #include "mlir/Pass/Pass.h"  // TF:llvm-project
-#include "tensorflow/compiler/mlir/disc/IR/hlo_disc_ops.h"
-#include "tensorflow/compiler/mlir/disc/IR/lhlo_disc_ops.h"
-#include "tensorflow/compiler/mlir/disc/disc_util.h"
-#include "tensorflow/compiler/mlir/disc/transforms/PassDetail.h"
-#include "tensorflow/compiler/mlir/disc/transforms/disc_map_hlo_to_lhlo_op.h"
-#include "tensorflow/compiler/mlir/disc/transforms/placement_utils.h"
+#include "mlir/disc/IR/hlo_disc_ops.h"
+#include "mlir/disc/IR/lhlo_disc_ops.h"
+#include "mlir/disc/disc_util.h"
+#include "mlir/disc/transforms/PassDetail.h"
+#include "mlir/disc/transforms/disc_map_hlo_to_lhlo_op.h"
+#include "mlir/disc/transforms/placement_utils.h"
 
 // This file implements logic to assign memory space for each memref type.
 
@@ -44,19 +45,11 @@ namespace disc_ral {
 
 namespace {
 
-// Returns a new memref type with provided memory space
-MemRefType copyWithMemorySpace(MLIRContext* ctx, MemRefType type,
-                               StringRef memory_space) {
-  Attribute memSpace = StringAttr::get(ctx, memory_space);
-  return MemRefType::get(type.getShape(), type.getElementType(),
-                         type.getLayout(), memSpace);
-}
-
 // return a new memref type with provided memory space if the input type if a
 // memref type otherwise return the original type.
-Type maybeConvert(MLIRContext* ctx, Type type, StringRef memory_space) {
+Type maybeConvert(MLIRContext* ctx, Type type, Attribute memory_space) {
   if (auto memref = type.dyn_cast<MemRefType>()) {
-    return copyWithMemorySpace(ctx, memref, memory_space);
+    return placement_utils::copyWithMemorySpace(ctx, memref, memory_space);
   }
   return type;
 }
@@ -64,8 +57,8 @@ Type maybeConvert(MLIRContext* ctx, Type type, StringRef memory_space) {
 // Returns true if the type is memref.
 bool isMemRefType(Type t) { return t.dyn_cast<MemRefType>() != nullptr; }
 
-LogicalResult updateAssignment(DenseMap<Value, StringRef>& assignment,
-                               Value value, StringRef memory_space,
+LogicalResult updateAssignment(DenseMap<Value, gpu::AddressSpace>& assignment,
+                               Value value, gpu::AddressSpace memory_space,
                                bool& converged) {
   auto it = assignment.find(value);
   if (it == assignment.end()) {
@@ -76,8 +69,8 @@ LogicalResult updateAssignment(DenseMap<Value, StringRef>& assignment,
   return (it->second == memory_space) ? success() : failure();
 }
 
-LogicalResult mergeAssignment(DenseMap<Value, StringRef>& assignment, Value lhs,
-                              Value rhs, bool& converged) {
+LogicalResult mergeAssignment(DenseMap<Value, gpu::AddressSpace>& assignment,
+                              Value lhs, Value rhs, bool& converged) {
   auto lhs_it = assignment.find(lhs);
   auto rhs_it = assignment.find(rhs);
 
@@ -111,42 +104,42 @@ struct DiscAssignMemorySpacePass
   LogicalResult processLmhloOperation(
       Operation* op, const SmallVectorImpl<StringRef>& input_placements,
       const SmallVectorImpl<StringRef>& output_placements,
-      DenseMap<Value, StringRef>& assignment, bool& converged);
+      DenseMap<Value, gpu::AddressSpace>& assignment, bool& converged);
 
   LogicalResult processOperation(
       Operation* op, const SmallVectorImpl<StringRef>& input_placements,
       const SmallVectorImpl<StringRef>& output_placements,
-      DenseMap<Value, StringRef>& assignment, bool& converged);
+      DenseMap<Value, gpu::AddressSpace>& assignment, bool& converged);
 
   LogicalResult processBlock(
       Block* block, const SmallVectorImpl<StringRef>& input_placements,
       const SmallVectorImpl<StringRef>& output_placements,
-      DenseMap<Value, StringRef>& assignment, bool& converged);
+      DenseMap<Value, gpu::AddressSpace>& assignment, bool& converged);
 
   LogicalResult processRegion(
       Region* region, const SmallVectorImpl<StringRef>& input_placements,
       const SmallVectorImpl<StringRef>& output_placements,
-      DenseMap<Value, StringRef>& assignment, bool& converged);
+      DenseMap<Value, gpu::AddressSpace>& assignment, bool& converged);
 
   LogicalResult applyAssignment(
-      FuncOp main, DenseMap<Value, StringRef>& assignment,
+      func::FuncOp main, DenseMap<Value, gpu::AddressSpace>& assignment,
       const SmallVectorImpl<StringRef>& input_placements,
       const SmallVectorImpl<StringRef>& output_placements);
 
-  LogicalResult applyRegionAssignment(Region*,
-                                      DenseMap<Value, StringRef>& assignment);
+  LogicalResult applyRegionAssignment(
+      Region*, DenseMap<Value, gpu::AddressSpace>& assignment);
 
-  LogicalResult applyBlockAssignment(Block*,
-                                     DenseMap<Value, StringRef>& assignment);
+  LogicalResult applyBlockAssignment(
+      Block*, DenseMap<Value, gpu::AddressSpace>& assignment);
 
   LogicalResult applyOperationAssignment(
-      Operation*, DenseMap<Value, StringRef>& assignment);
+      Operation*, DenseMap<Value, gpu::AddressSpace>& assignment);
 
   LogicalResult cloneSmallLmhloConstOps(ModuleOp m);
 
   void runOnOperation() override {
     ModuleOp m = getOperation();
-    FuncOp main = m.lookupSymbol<FuncOp>(entry_func_name_);
+    func::FuncOp main = m.lookupSymbol<func::FuncOp>(entry_func_name_);
     if (!main) {
       m.emitError("entry func: " + entry_func_name_ + " not found");
       signalPassFailure();
@@ -172,7 +165,7 @@ struct DiscAssignMemorySpacePass
     }
 
     // mapping a value to its placement info
-    DenseMap<Value, StringRef> assignment;
+    DenseMap<Value, gpu::AddressSpace> assignment;
 
     // Try to propagate memory space assignment.
     bool converged;
@@ -212,8 +205,8 @@ struct DiscAssignMemorySpacePass
 // some limitations. One major problem is that we suppose that large const will
 // not be shared by lmhlo consumers placed on different devices.
 LogicalResult DiscAssignMemorySpacePass::cloneSmallLmhloConstOps(ModuleOp m) {
-  SmallVector<lmhlo::ConstOp> constOps;
-  m.walk([&](lmhlo::ConstOp constOp) {
+  SmallVector<lmhlo::ConstantOp> constOps;
+  m.walk([&](lmhlo::ConstantOp constOp) {
     Value out = constOp->getOperand(0);
     if (constOp->getParentOfType<lmhlo::ReduceOp>() ||
         constOp->getParentOfType<lmhlo::FusionOp>()) {
@@ -224,7 +217,7 @@ LogicalResult DiscAssignMemorySpacePass::cloneSmallLmhloConstOps(ModuleOp m) {
     }
   });
 
-  for (lmhlo::ConstOp constOp : constOps) {
+  for (lmhlo::ConstantOp constOp : constOps) {
     // Use set vector to make sure having deterministic iteration order.
     SetVector<Operation*> lmhloUsers;
     Value out = constOp->getOperand(0);
@@ -253,7 +246,7 @@ LogicalResult DiscAssignMemorySpacePass::cloneSmallLmhloConstOps(ModuleOp m) {
 LogicalResult DiscAssignMemorySpacePass::processRegion(
     Region* region, const SmallVectorImpl<StringRef>& input_placements,
     const SmallVectorImpl<StringRef>& output_placements,
-    DenseMap<Value, StringRef>& assignment, bool& converged) {
+    DenseMap<Value, gpu::AddressSpace>& assignment, bool& converged) {
   // Only SCF is supported a.t.m.
   if (region->getBlocks().size() != 1) {
     getOperation().emitError("suppose a single block inside the region");
@@ -266,11 +259,14 @@ LogicalResult DiscAssignMemorySpacePass::processRegion(
 LogicalResult DiscAssignMemorySpacePass::processBlock(
     Block* block, const SmallVectorImpl<StringRef>& input_placements,
     const SmallVectorImpl<StringRef>& output_placements,
-    DenseMap<Value, StringRef>& assignment, bool& converged) {
+    DenseMap<Value, gpu::AddressSpace>& assignment, bool& converged) {
   // mapping block arguments
   for (auto&& z : llvm::zip(block->getArguments(), input_placements)) {
-    if (failed(updateAssignment(assignment, std::get<0>(z), std::get<1>(z),
-                                converged))) {
+    if (std::get<1>(z) != placement_utils::kGpu) {
+      continue;
+    }
+    if (failed(updateAssignment(assignment, std::get<0>(z),
+                                gpu::AddressSpace::Global, converged))) {
       return failure();
     }
   }
@@ -279,8 +275,11 @@ LogicalResult DiscAssignMemorySpacePass::processBlock(
   Operation& returnOp = block->back();
   assert(returnOp.hasTrait<OpTrait::ReturnLike>());
   for (auto&& z : llvm::zip(returnOp.getOperands(), output_placements)) {
-    if (failed(updateAssignment(assignment, std::get<0>(z), std::get<1>(z),
-                                converged))) {
+    if (std::get<1>(z) != placement_utils::kGpu) {
+      continue;
+    }
+    if (failed(updateAssignment(assignment, std::get<0>(z),
+                                gpu::AddressSpace::Global, converged))) {
       return failure();
     }
   }
@@ -303,7 +302,7 @@ LogicalResult DiscAssignMemorySpacePass::processBlock(
 LogicalResult DiscAssignMemorySpacePass::processOperation(
     Operation* op, const SmallVectorImpl<StringRef>& input_placements,
     const SmallVectorImpl<StringRef>& output_placements,
-    DenseMap<Value, StringRef>& assignment, bool& converged) {
+    DenseMap<Value, gpu::AddressSpace>& assignment, bool& converged) {
   // Skip these metadata only ops since they don't change placement.
   if (isa<shape::ShapeOfOp, memref::DimOp>(op)) {
     return success();
@@ -321,25 +320,48 @@ LogicalResult DiscAssignMemorySpacePass::processOperation(
   // host to device copy
   // input should be placed on cpu and output should be placed on gpu.
   if (isa<lmhlo_disc::H2DOp>(op)) {
-    LogicalResult status = updateAssignment(assignment, op->getOperand(0),
-                                            placement_utils::kCpu, converged);
-    if (!failed(status)) {
-      status = updateAssignment(assignment, op->getOperand(1),
-                                placement_utils::kGpu, converged);
-    }
+    LogicalResult status = updateAssignment(
+        assignment, op->getOperand(1), gpu::AddressSpace::Global, converged);
     return status;
   }
 
   // device to host copy
   // input should be placed on gpu and output should be placed on cpu.
   if (isa<lmhlo_disc::D2HOp>(op)) {
-    LogicalResult status = updateAssignment(assignment, op->getOperand(0),
-                                            placement_utils::kGpu, converged);
-    if (!failed(status)) {
-      status = updateAssignment(assignment, op->getOperand(1),
-                                placement_utils::kCpu, converged);
-    }
+    LogicalResult status = updateAssignment(
+        assignment, op->getOperand(0), gpu::AddressSpace::Global, converged);
     return status;
+  }
+
+  if (auto customCallV2Op = dyn_cast<lmhlo_disc::CustomCallV2Op>(op)) {
+    auto parseAndApply = [&](StringRef s, ValueRange vs) {
+      SmallVector<StringRef, 4> parsedItems;
+      s.split(parsedItems, ',', /*MaxSplit=*/-1, /*KeepEmpty=*/false);
+      if (parsedItems.size() != vs.size()) return failure();
+      for (const auto& z : llvm::zip(parsedItems, vs)) {
+        auto placement = std::get<0>(z);
+        if (placement == "s" || placement == "h" ||
+            placement == "x" && !this->gpu_enabled_) {
+        } else if (placement == "d" || placement == "x" && this->gpu_enabled_) {
+          if (failed(updateAssignment(assignment, std::get<1>(z),
+                                      gpu::AddressSpace::Global, converged))) {
+            return failure();
+          }
+        } else {
+          return failure();
+        }
+      }
+      return success();
+    };
+    if (failed(parseAndApply(customCallV2Op.getInputPlacements(),
+                             op->getOperands())))
+      return op->emitError()
+             << " failed to parse and apply the input placements\n";
+    if (failed(parseAndApply(customCallV2Op.getOutputPlacements(),
+                             op->getResults())))
+      return op->emitError()
+             << " failed to parse and apply the output placements\n";
+    return success();
   }
 
   // process lmhlo ops
@@ -361,19 +383,8 @@ LogicalResult DiscAssignMemorySpacePass::processOperation(
 
   // TODO(disc): using an unsupported op list
   // TODO(disc): support cross function inference.
-  if (isa<CallOp>(op)) {
+  if (isa<func::CallOp>(op)) {
     return op->emitOpError() << "function call is not supported a.t.m.";
-  }
-
-  // memref that is explicitly operated by load/store ops are supposed to be
-  // placed on cpu.
-  if (isa<memref::LoadOp>(op)) {
-    return updateAssignment(assignment, op->getOperand(0),
-                            placement_utils::kCpu, converged);
-  }
-  if (isa<memref::StoreOp>(op)) {
-    return updateAssignment(assignment, op->getOperand(1),
-                            placement_utils::kCpu, converged);
   }
 
   // TODO(disc): check other ops.
@@ -384,14 +395,10 @@ LogicalResult DiscAssignMemorySpacePass::processOperation(
 LogicalResult DiscAssignMemorySpacePass::processLmhloOperation(
     Operation* op, const SmallVectorImpl<StringRef>& input_placements,
     const SmallVectorImpl<StringRef>& output_placements,
-    DenseMap<Value, StringRef>& assignment, bool& converged) {
+    DenseMap<Value, gpu::AddressSpace>& assignment, bool& converged) {
   // Some operands of the lmhlo ops have to be placed on cpu.
   auto shape_operands = placement_utils::getShapeCalcOperandList(op);
   for (int idx : shape_operands) {
-    if (failed(updateAssignment(assignment, op->getOperand(idx),
-                                placement_utils::kCpu, converged))) {
-      return failure();
-    }
   }
 
   // non-shape operands
@@ -412,14 +419,15 @@ LogicalResult DiscAssignMemorySpacePass::processLmhloOperation(
 
   for (Value non_shape_operand : non_shape_operands) {
     auto it = assignment.find(non_shape_operand);
-    if (it == assignment.end()) {
-      continue;
+    if (it == assignment.end()) continue;
+    if (!placement.empty() && !(it->second == gpu::AddressSpace::Global &&
+                                placement == placement_utils::kGpu)) {
+      return op->emitError() << "non shape operands not have same placements";
     }
-    if (!placement.empty() && it->second != placement) {
-      op->emitError("non shape operands not have same placements");
-      return failure();
+    if (it->second == gpu::AddressSpace::Global) {
+      placement = placement_utils::kGpu;
     }
-    placement = it->second;
+    // Do not need to deal with kCpu.
   }
 
   if (placement.empty()) {
@@ -430,11 +438,9 @@ LogicalResult DiscAssignMemorySpacePass::processLmhloOperation(
   LogicalResult status = success();
   for (Value not_shape_operand : non_shape_operands) {
     if (placement == placement_utils::kCpu) {
-      status = updateAssignment(assignment, not_shape_operand,
-                                placement_utils::kCpu, converged);
     } else if (placement == placement_utils::kGpu) {
       status = updateAssignment(assignment, not_shape_operand,
-                                placement_utils::kGpu, converged);
+                                gpu::AddressSpace::Global, converged);
     } else {
       // unknown placement
       status = failure();
@@ -446,7 +452,7 @@ LogicalResult DiscAssignMemorySpacePass::processLmhloOperation(
 }
 
 LogicalResult DiscAssignMemorySpacePass::applyAssignment(
-    FuncOp main, DenseMap<Value, StringRef>& assignment,
+    func::FuncOp main, DenseMap<Value, gpu::AddressSpace>& assignment,
     const SmallVectorImpl<StringRef>& input_placements,
     const SmallVectorImpl<StringRef>& output_placements) {
   // apply assignment inside the region
@@ -455,18 +461,34 @@ LogicalResult DiscAssignMemorySpacePass::applyAssignment(
 
   // update entry function type.
   MLIRContext* ctx = main.getContext();
+  SmallVector<Attribute> input_placements_attr;
+  Attribute gpu_attr =
+      gpu::AddressSpaceAttr::get(ctx, gpu::AddressSpace::Global);
+  Attribute default_attr =
+      IntegerAttr::get(IntegerType::get(main->getContext(), 64), 0);
+  for (auto& input_placement : input_placements) {
+    input_placements_attr.push_back(
+        input_placement == placement_utils::kGpu ? gpu_attr : default_attr);
+  }
+  SmallVector<Attribute> output_placements_attr;
+  for (auto& output_placement : output_placements) {
+    output_placements_attr.push_back(
+        output_placement == placement_utils::kGpu ? gpu_attr : default_attr);
+  }
   SmallVector<Type, 4> input_types;
   SmallVector<Type, 4> output_types;
-  llvm::transform(llvm::zip(main.getType().getInputs(), input_placements),
-                  std::back_inserter(input_types),
-                  [&](const std::tuple<Type, StringRef>& v) {
-                    return maybeConvert(ctx, std::get<0>(v), std::get<1>(v));
-                  });
-  llvm::transform(llvm::zip(main.getType().getResults(), output_placements),
-                  std::back_inserter(output_types),
-                  [&](const std::tuple<Type, StringRef>& v) {
-                    return maybeConvert(ctx, std::get<0>(v), std::get<1>(v));
-                  });
+  llvm::transform(
+      llvm::zip(main.getFunctionType().getInputs(), input_placements_attr),
+      std::back_inserter(input_types),
+      [&](const std::tuple<Type, Attribute>& v) {
+        return maybeConvert(ctx, std::get<0>(v), std::get<1>(v));
+      });
+  llvm::transform(
+      llvm::zip(main.getFunctionType().getResults(), output_placements_attr),
+      std::back_inserter(output_types),
+      [&](const std::tuple<Type, Attribute>& v) {
+        return maybeConvert(ctx, std::get<0>(v), std::get<1>(v));
+      });
 
   // Update entry function type.
   main.setType(FunctionType::get(ctx, input_types, output_types));
@@ -474,8 +496,8 @@ LogicalResult DiscAssignMemorySpacePass::applyAssignment(
 }
 
 LogicalResult DiscAssignMemorySpacePass::applyRegionAssignment(
-    Region* region, DenseMap<Value, StringRef>& assignment) {
-  auto main = cast<FuncOp>(region->getParentOp());
+    Region* region, DenseMap<Value, gpu::AddressSpace>& assignment) {
+  auto main = cast<func::FuncOp>(region->getParentOp());
   for (Block& block : llvm::make_early_inc_range(*region)) {
     if (failed(applyBlockAssignment(&block, assignment))) return failure();
   }
@@ -483,7 +505,7 @@ LogicalResult DiscAssignMemorySpacePass::applyRegionAssignment(
 }
 
 LogicalResult DiscAssignMemorySpacePass::applyBlockAssignment(
-    Block* block, DenseMap<Value, StringRef>& assignment) {
+    Block* block, DenseMap<Value, gpu::AddressSpace>& assignment) {
   // update block argument
   int originalArgNum = block->getNumArguments();
   for (int i = 0; i < originalArgNum; ++i) {
@@ -492,7 +514,9 @@ LogicalResult DiscAssignMemorySpacePass::applyBlockAssignment(
     Type ty = arg.getType();
     auto it = assignment.find(arg);
     if (it != assignment.end()) {
-      ty = maybeConvert(arg.getContext(), ty, it->second);
+      ty = maybeConvert(
+          arg.getContext(), ty,
+          gpu::AddressSpaceAttr::get(arg.getContext(), it->second));
     }
     Value newArg = block->addArgument(ty, arg.getLoc());
     arg.replaceAllUsesWith(newArg);
@@ -504,7 +528,7 @@ LogicalResult DiscAssignMemorySpacePass::applyBlockAssignment(
     block->eraseArgument(0);
   }
 
-  auto main = cast<FuncOp>(block->getParentOp());
+  auto main = cast<func::FuncOp>(block->getParentOp());
   for (Operation& op : llvm::make_early_inc_range(*block)) {
     if (failed(applyOperationAssignment(&op, assignment))) return failure();
   }
@@ -513,48 +537,64 @@ LogicalResult DiscAssignMemorySpacePass::applyBlockAssignment(
 
 template <typename OpTy>
 Operation* replaceResultType(Operation* op,
-                             DenseMap<Value, StringRef>& assignment) {
+                             DenseMap<Value, gpu::AddressSpace>& assignment) {
   OpBuilder b(op);
   Location loc = op->getLoc();
-  Value oldValue = op->getResult(0);
-  Type oldType = oldValue.getType();
-  StringRef placement = assignment[oldValue];
-  Type newType = maybeConvert(op->getContext(), oldType, placement);
-  auto newOp = b.create<OpTy>(loc, newType, op->getOperands(), op->getAttrs());
-  oldValue.replaceAllUsesWith(newOp.getResult());
-  assignment[newOp.getResult()] = placement;
-  assignment.erase(oldValue);
+  SmallVector<Type> newResultTypes;
+  for (Value oldValue : op->getResults()) {
+    Type oldType = oldValue.getType();
+    auto it = assignment.find(oldValue);
+    if (it != assignment.end()) {
+      newResultTypes.push_back(maybeConvert(
+          op->getContext(), oldType,
+          gpu::AddressSpaceAttr::get(op->getContext(), it->second)));
+    } else {
+      newResultTypes.push_back(oldType);
+    }
+  }
+  auto newOp =
+      b.create<OpTy>(loc, newResultTypes, op->getOperands(), op->getAttrs());
+  for (const auto& z : llvm::zip(op->getResults(), newOp->getResults())) {
+    Value oldValue = std::get<0>(z);
+    Value newValue = std::get<1>(z);
+    oldValue.replaceAllUsesWith(newValue);
+    auto it = assignment.find(oldValue);
+    if (it != assignment.end()) {
+      assignment[newValue] = it->second;
+      assignment.erase(oldValue);
+    }
+  }
   op->erase();
   return newOp;
 }
 
 template <typename OpTy>
-Operation* tryReplaceResultType(Operation* op,
-                                DenseMap<Value, StringRef>& assignment) {
+Operation* tryReplaceResultType(
+    Operation* op, DenseMap<Value, gpu::AddressSpace>& assignment) {
   if (!isa<OpTy>(op)) return nullptr;
   return replaceResultType<OpTy>(op, assignment);
 }
 
 template <typename First, typename Second, typename... OtherOpList>
-Operation* tryReplaceResultType(Operation* op,
-                                DenseMap<Value, StringRef>& assignment) {
+Operation* tryReplaceResultType(
+    Operation* op, DenseMap<Value, gpu::AddressSpace>& assignment) {
   if (Operation* newOp = tryReplaceResultType<First>(op, assignment))
     return newOp;
   return tryReplaceResultType<Second, OtherOpList...>(op, assignment);
 }
 
 LogicalResult DiscAssignMemorySpacePass::applyOperationAssignment(
-    Operation* op, DenseMap<Value, StringRef>& assignment) {
+    Operation* op, DenseMap<Value, gpu::AddressSpace>& assignment) {
   if (llvm::none_of(op->getResults(),
                     [&](Value v) { return assignment.count(v) != 0; })) {
     return success();
   }
 
   // clang-format: off
-  Operation* newOp =
-      tryReplaceResultType<memref::AllocOp, memref::AllocaOp, memref::SubViewOp,
-                           memref::ViewOp, memref::CastOp,
-                           memref::ReinterpretCastOp>(op, assignment);
+  Operation* newOp = tryReplaceResultType<
+      memref::AllocOp, memref::AllocaOp, memref::SubViewOp, memref::ViewOp,
+      memref::CastOp, memref::ReinterpretCastOp, lmhlo_disc::CustomCallV2Op,
+      lmhlo_disc::OptimizationBarrierOp>(op, assignment);
   // clang-format: on
 
   if (newOp) {

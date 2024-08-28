@@ -13,14 +13,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "tensorflow/compiler/mlir/disc/tests/mlir_feature_test.h"
-#include "tensorflow/compiler/mlir/disc/tests/mlir_test.h"
+#include "mlir/disc/tests/mlir_feature_test.h"
+#include "mlir/disc/tests/mlir_test.h"
 #include "tensorflow/core/platform/test.h"
 
 namespace mlir_test {
 
-const std::string c_ft_path =
-    "tensorflow/compiler/mlir/disc/tests/regression/data/";
+const std::string c_ft_path = "mlir/disc/tests/regression/data/";
 
 TEST(MultiCCTest, BasicTest) {
   EXPECT_TRUE(feature_test_main(
@@ -31,6 +30,7 @@ TEST(MultiCCTest, BasicTest) {
       /*input_descriptors*/ {"13x21x100xf32_X"},
       /*output_descriptors*/ {"f32_X"},
       /*input_vals*/ {},
+      /*expected_output_vals*/ {},
       /*profiling*/ false,
       /*multi_cc_mode*/ true,
       /*multi_cc_mode_dbg_ptx_only*/ false));
@@ -45,6 +45,7 @@ TEST(MultiCCTest, PtxTest) {
       /*input_descriptors*/ {"13x21x100xf32_X"},
       /*output_descriptors*/ {"f32_X"},
       /*input_vals*/ {},
+      /*expected_output_vals*/ {},
       /*profiling*/ false,
       /*multi_cc_mode*/ true,
       /*multi_cc_mode_dbg_ptx_only*/ true));

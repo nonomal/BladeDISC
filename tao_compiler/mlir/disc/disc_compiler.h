@@ -34,6 +34,8 @@ enum CodeGenMode {
 struct GpuDeviceInfo {
   int cc_major = -1;
   int cc_minor = -1;
+  int sm_count = -1;
+  int max_threads_per_sm = -1;
   int device_ordinal = 0;
 };
 
@@ -67,6 +69,10 @@ struct CpuLoweringOptions {
 
   // If true, codegen for multi threading execution environment
   bool target_multi_threading = true;
+
+  std::string llvm_target_triple = "";
+  std::string llvm_target_cpu = "";
+  std::string llvm_target_cpu_features = "";
 };
 
 struct DISCLoweringOptions {

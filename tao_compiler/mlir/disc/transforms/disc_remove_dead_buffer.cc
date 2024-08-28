@@ -22,13 +22,14 @@ limitations under the License.
 
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/Debug.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/Location.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/Interfaces/ViewLikeInterface.h"
 #include "mlir/Pass/Pass.h"
-#include "tensorflow/compiler/mlir/disc/disc_util.h"
-#include "tensorflow/compiler/mlir/disc/transforms/PassDetail.h"
+#include "mlir/disc/disc_util.h"
+#include "mlir/disc/transforms/PassDetail.h"
 
 namespace mlir {
 namespace disc_ral {
@@ -78,7 +79,7 @@ struct RemoveDeadBufferPass
 
 }  // namespace
 
-std::unique_ptr<OperationPass<FuncOp>> createDiscRemoveDeadBufferPass() {
+std::unique_ptr<OperationPass<func::FuncOp>> createDiscRemoveDeadBufferPass() {
   return std::make_unique<RemoveDeadBufferPass>();
 }
 

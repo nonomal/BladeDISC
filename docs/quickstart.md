@@ -49,8 +49,8 @@ with g.as_default():
     ret = t3 * t3
 
     with tf.Session() as s:
-        np_x = np.ones([10, 10]).astype(np.float32)
-        np_y = np.ones([10, 10]).astype(np.float32)
+        np_x = np.ones([1, 2]).astype(np.float32)
+        np_y = np.ones([1, 2]).astype(np.float32)
         r = s.run(ret, {x: np_x, y: np_y})
         print("x.shape={}, y.shape={}, ret={}".format(np_x.shape, np_y.shape, r))
 ```
@@ -63,7 +63,7 @@ To make PyTorch users easier to use, BladeDISC provides simple
 Python API is as follows:
 
 ``` python
-import torch_addons
+import torch_blade
 
 with torch.no_grad():
     # blade_model is the optimized module by BladeDISC

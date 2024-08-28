@@ -50,10 +50,26 @@ std::unique_ptr<OperationPass<ModuleOp>> createReviseArgsForStaticRankPass();
 
 // Lowers the roots of lmhlo.fusion to parallel loops
 std::unique_ptr<OperationPass<FuncOp>>
-createDiscLhloLegalizeRootsToParallelLoopsPass();
+createDiscLhloLegalizeRootsToParallelLoopsPass(int sm_count = -1,
+                                               int cc_major = 8,
+                                               int cc_minor = 0);
 
 // Canonicalize conv ops to be suitable for lowering to cudnn lib calls.
-std::unique_ptr<OperationPass<FuncOp>> createDiscConvRewriter();
+std::unique_ptr<OperationPass<FuncOp>> createDiscConvRewriter(int cc_major = 8,
+                                                              int cc_minor = 0);
+
+// Canonicalize qconv ops to be suitable for lowering to cudnn lib calls.
+std::unique_ptr<OperationPass<FuncOp>> createDiscQuantizedConvRewriter(
+    int cc_major = 8, int cc_minor = 0);
+
+std::unique_ptr<OperationPass<FuncOp>> createDiscQuantizedDotRewriter();
+
+// Rewrite and decompose mhlo ops
+std::unique_ptr<OperationPass<FuncOp>>
+createDiscMhloDecompositionRewriterPass();
+
+// Rewrite mhlo::ReduceOp
+std::unique_ptr<OperationPass<FuncOp>> createDiscReductionRewriterPass();
 
 // Rewrite dot to fold transpose.
 std::unique_ptr<OperationPass<FuncOp>> createDiscDotRewriterPass();
@@ -64,18 +80,19 @@ std::unique_ptr<OperationPass<FuncOp>> createDiscGpuConvPaddingLegalization();
 
 // A pass to specialize fusion op with some speculation.
 std::unique_ptr<OperationPass<FuncOp>>
-createDiscSpecializeFusionWithSpeculationPass(int cc_major = 7,
-                                              int cc_minor = 5);
+createDiscSpecializeFusionWithSpeculationPass(int sm_count = -1,
+                                              int max_threads_per_sm = -1);
 
 // Eliminates certain element types as the input or output of ops by inserting
 // Convert ops.
 std::unique_ptr<OperationPass<FuncOp>> createDiscElementTypeConverterPass(
-    bool enable_fp16_gemm = false);
+    bool enable_fp16_gemm = false, bool enable_fp16_conv = false,
+    bool promote_fp16_sensitive_ops_to_f32 = false);
 
 // Greedily maps loops to GPU hardware dimensions.
 // TODO: this pass is only a wrapper to mlir func, copied from
 // tools/kernel_gen/transforms Should consider of adding this pass to mlir repo.
-std::unique_ptr<OperationPass<FuncOp>> createMapParallelLoopsPass();
+// std::unique_ptr<OperationPass<FuncOp>> createMapParallelLoopsPass();
 
 // Collapses ParallelsOp into 1-D.
 std::unique_ptr<OperationPass<FuncOp>> createDiscParallelLoopCollapsingPass();
@@ -88,7 +105,8 @@ std::unique_ptr<OperationPass<FuncOp>> createParallelLoopTilingPass(
 
 // Fuse lmhlo ops to kLoop/kInput fusion patterns
 std::unique_ptr<OperationPass<FuncOp>> createDiscFusionPass(
-    bool gpu_enabled = true, const std::string& fusion_strategy = "base");
+    bool gpu_enabled = true, const std::string& fusion_strategy = "base",
+    bool mlir_compute_intensive_codegen = false);
 
 // Fuse splat constant to avoid memory access
 std::unique_ptr<OperationPass<FuncOp>> createDiscFuseSplatConstPass();
@@ -107,7 +125,8 @@ std::unique_ptr<OperationPass<ModuleOp>> createPlacerPass(bool on_gpu = true);
 std::unique_ptr<OperationPass<ModuleOp>> createReviseGpuKernelOutliningPass();
 
 // Lower some specific ops to library calls (modeled by `disc_ral.launch` op).
-std::unique_ptr<OperationPass<FuncOp>> createDiscLowerToLibraryCallPass();
+std::unique_ptr<OperationPass<FuncOp>> createDiscLowerToLibraryCallPass(
+    bool gpu_enabled = true);
 
 // Assign memory space tag for each memref type.
 std::unique_ptr<OperationPass<ModuleOp>> createDiscAssignMemorySpacePass(
@@ -145,7 +164,9 @@ std::unique_ptr<OperationPass<FuncOp>>
 createDiscMemRefLoadStoreSimplifierPass();
 
 // Lowering some tensorflow ops.
-std::unique_ptr<OperationPass<FuncOp>> createDiscLowerTfPass();
+std::unique_ptr<OperationPass<FuncOp>> createDiscLowerTfPass(
+    const std::string& pdll_files = "",
+    const std::string& pdll_include_dirs = "");
 
 // A pass to remove buffers that are not accessed by others
 std::unique_ptr<OperationPass<FuncOp>> createDiscRemoveDeadBufferPass();
@@ -155,7 +176,8 @@ std::unique_ptr<OperationPass<ModuleOp>> createDiscAssignKernelNamePass();
 
 // Lower GPU ops to NVVM ops. Deal with GenericAtomicRMW specifically.
 std::unique_ptr<OperationPass<gpu::GPUModuleOp>>
-createDiscLowerGpuOpsToNVVMOpsPass(unsigned indexBitwidth = 0);
+createDiscLowerGpuOpsToNVVMOpsPass(unsigned indexBitwidth = 0,
+                                   bool hasRedux = false);
 
 // Lower GPU ops to ROCDL ops.
 std::unique_ptr<OperationPass<gpu::GPUModuleOp>>
@@ -168,6 +190,8 @@ createDiscUnhandledAtomicRMWConverterPass();
 // propagate some known shape information.
 std::unique_ptr<OperationPass<ModuleOp>> createDiscShapeSimplifierPass(
     const std::string& entry_func_name = "main", bool insert_tie_shape = false);
+
+std::unique_ptr<OperationPass<ModuleOp>> createDiscShapePropagatePass();
 
 // Using approximation impl for some special math ops.
 std::unique_ptr<OperationPass<FuncOp>> createDiscMathApproximationPass();
@@ -205,8 +229,114 @@ std::unique_ptr<OperationPass<FuncOp>> createLhloFusionInlinerPass();
 // Dot merge optimization.
 std::unique_ptr<OperationPass<FuncOp>> createDiscDotMergePass();
 
+// Quantized dot merge optimization.
+std::unique_ptr<OperationPass<FuncOp>> createDiscQuantizedDotMergePass();
+
 // Apply some basic algebra simplification optimizations.
-std::unique_ptr<OperationPass<FuncOp>> createDiscAlgebraSimplifierPass();
+std::unique_ptr<OperationPass<FuncOp>> createDiscAlgebraicSimplifierPass();
+
+// apply some shape-related optimization.
+std::unique_ptr<OperationPass<ModuleOp>> createDiscShapeOptimizationPass(
+    const std::string& entry_func_name = "main", bool keep_tie_shape = false);
+
+// strip disc shape constraint related ops.
+std::unique_ptr<OperationPass<ModuleOp>> createStripShapeConstraintOpsPass();
+
+// SCF for-loop unrolling and interleaving.
+std::unique_ptr<OperationPass<FuncOp>> createForLoopUnrollInterleavePass();
+
+std::unique_ptr<OperationPass<func::FuncOp>>
+createDiscDuplicateComputationForFusionPass(
+    bool gpu_enabled = true, const std::string& fusion_strategy = "base");
+
+// Eliminate unused InsertValueOp inside LLVMFuncOp.
+std::unique_ptr<OperationPass<LLVM::LLVMFuncOp>>
+createLLVMInsertValueSimplifierPass();
+
+// Eliminate dead arguments of GPU LLVM functions.
+std::unique_ptr<OperationPass<gpu::GPUModuleOp>>
+createFunctionDeadArgumentEliminationPass();
+
+// Apply loop invariant code motion on operators with side effect.
+std::unique_ptr<OperationPass<gpu::GPUFuncOp>>
+createSideEffectLoopInvariantCodeMotionPass();
+
+// Apply dense gemm/conv to sparse gemm/conv optimizations.
+std::unique_ptr<OperationPass<FuncOp>> createDiscDenseToSparsePass(
+    bool enable_sparse_convert = false);
+
+// Remove some redundant transpose ops before sparse gemm/conv.
+std::unique_ptr<OperationPass<FuncOp>>
+createDiscSparseGemmTransposeSimplifierPass();
+
+// Epand ext/trunc of bfloat16
+std::unique_ptr<OperationPass<func::FuncOp>> createDiscBF16ExpansionPass();
+
+// Converts fake_quant annotated graph to the real quantized version.
+std::unique_ptr<OperationPass<func::FuncOp>> createDiscConvertFakeQuantOpPass();
+
+// Lowers quantize and dequantize ops to a bunch of basic elementwise ops.
+std::unique_ptr<OperationPass<func::FuncOp>>
+createDiscLowerQuantizeAndDequantizePass();
+
+// transform weight data layout for ft's weight-only qgemm.
+std::unique_ptr<OperationPass<func::FuncOp>>
+createDiscTranformWeightDataLayoutForWeightOnlyQuantPass();
+
+// Lowers quantize and dequantize ops to a bunch of basic elementwise ops on
+// gpu.
+std::unique_ptr<OperationPass<func::FuncOp>>
+createDiscLowerGpuQuantizeAndDequantizePass();
+
+// Convert mhlo.dynamic_slice to mhlo.real_dynamic_slice
+std::unique_ptr<OperationPass<FuncOp>> createDiscDynamicSliceConverterPass();
+
+// Sparse op rewriter
+std::unique_ptr<OperationPass<FuncOp>> createDiscSparseOpRewriterPass();
+
+// Inserts dealloc ops for some disc specific ops (e.g. custom_call_v2 op).
+std::unique_ptr<OperationPass<FuncOp>> createDiscBufferDeallocationPass();
+
+// Rewrites custom call ops according to its layout attribute.
+std::unique_ptr<OperationPass<func::FuncOp>> createDiscCustomCallRewriterPass();
+
+// Convert compute-intensive fusion to the call of FuncOp.
+std::unique_ptr<OperationPass<ModuleOp>> createDiscCompIntensFusionToFuncPass();
+
+// Convert the functions representing compute-intensive fusion into CUDA source
+// code.
+std::unique_ptr<OperationPass<ModuleOp>>
+createDiscCompIntensFusionToCUDASourcePass(int cc_major = 8, int cc_minor = 0);
+
+// Compile GPU source code to library, possibly with host side logic.
+std::unique_ptr<OperationPass<ModuleOp>> createDiscGPUSourceToLibPass(
+    int cc_major = 8, int cc_minor = 0);
+
+// Legalizes transform-based fusion pattern to loop.
+std::unique_ptr<OperationPass<func::FuncOp>>
+createDiscTransformLegalizeToLoopPass(bool gpuEnabled = false,
+                                      const std::string& filename = "",
+                                      int cc_major = 8, int cc_minor = 0,
+                                      bool expensiveCheck = false);
+
+// Duplicate and fuse some computation into their fusion consumer to reduce
+// memory footprint.
+std::unique_ptr<OperationPass<func::FuncOp>>
+createDiscDuplicateComputationAfterFusionPass();
+
+// Erase dealloc ops for GPU func ops.
+std::unique_ptr<OperationPass<gpu::GPUFuncOp>>
+createDiscEraseBufferDeallocationPass();
+
+// Insert ArgsMutationOp for buffer reuse
+std::unique_ptr<OperationPass<ModuleOp>> createDiscInputOutputAliasPass();
+
+// Modifty buffer allocation inst to reduce buffer live range
+std::unique_ptr<OperationPass<ModuleOp>> createDiscReduceBufferLiveRangePass();
+
+// rewrite mhlo collective ops to disc custom library call
+std::unique_ptr<OperationPass<func::FuncOp>>
+createDiscCollectiveOpsRewriterPass();
 
 }  // namespace disc_ral
 }  // namespace mlir
@@ -216,6 +346,15 @@ namespace mhlo_disc {
 
 // Legalizes mhlo_disc ops to lmhlo_disc ops.
 std::unique_ptr<OperationPass<ModuleOp>> createDiscLegalizeToLhloPass();
+
+std::unique_ptr<OperationPass<ModuleOp>> createDiscLhloRewriterPass();
+
+std::unique_ptr<OperationPass<ModuleOp>>
+createDiscOptimizationBarrierExpandPass();
+
+std::unique_ptr<OperationPass<ModuleOp>> createDiscOpSchedulePass();
+
+std::unique_ptr<OperationPass<ModuleOp>> createDiscArgsMutationExpandPass();
 
 }  // namespace mhlo_disc
 }  // namespace mlir

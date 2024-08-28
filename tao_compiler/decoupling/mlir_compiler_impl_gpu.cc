@@ -9,19 +9,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "tensorflow/compiler/decoupling/mlir_compiler_impl_gpu.h"
+#include "decoupling/mlir_compiler_impl_gpu.h"
 
 #include "cuda.h"
 
 namespace tensorflow {
 namespace tao {
 
-#define RETURN_ON_CUDA_ERROR(expr, msg) \
-  {                                     \
-    auto _cuda_error = (expr);          \
-    if (_cuda_error != CUDA_SUCCESS) {  \
-      return errors::Internal(msg);     \
-    }                                   \
+#define RETURN_ON_CUDA_ERROR(expr, msg)                      \
+  {                                                          \
+    auto _cuda_error = (expr);                               \
+    if (_cuda_error != CUDA_SUCCESS) {                       \
+      const char* error_name;                                \
+      const char* error_string;                              \
+      cuGetErrorName(_cuda_error, &error_name);              \
+      cuGetErrorString(_cuda_error, &error_string);          \
+      std::string fullmsg = std::string(msg) + ". " +        \
+                            std::string(error_name) + ": " + \
+                            std::string(error_string);       \
+      return errors::Internal(fullmsg);                      \
+    }                                                        \
   }
 
 struct CompilerMLIR_GPU::Impl {
@@ -45,13 +52,27 @@ Status CompilerMLIR_GPU::Init(const TaoCompilerInput& input,
   RETURN_ON_CUDA_ERROR(
       cuDeviceComputeCapability(&ctx.cc_major, &ctx.cc_minor, device),
       "cuDeviceComputeCapability");
-  return Status::OK();
+  RETURN_ON_CUDA_ERROR(
+      cuDeviceGetAttribute(&ctx.sm_count,
+                           CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device),
+      "cuDeviceGetAttribute (MULTIPROCESSOR_COUNT)");
+  RETURN_ON_CUDA_ERROR(
+      cuDeviceGetAttribute(&ctx.max_threads_per_sm,
+                           CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR,
+                           device),
+      "cuDeviceGetAttribute (MAX_THREADS_PER_MULTIPROCESSOR)");
+  // RETURN_ON_CUDA_ERROR(
+  //     cuDeviceGetAttribute(&ctx.max_threads_per_block,
+  //                          CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK,
+  //                          device),
+  //     "cuDeviceGetAttribute (MAX_THREADS_PER_BLOCK)");
+  return tsl::OkStatus();
 }
 
 Status CompilerMLIR_GPU::FillDeviceInfo(
     mlir::disc_ral::DISCLoweringOptions& options) {
   options.gpu_info = impl_->device_context;
-  return Status::OK();
+  return tsl::OkStatus();
 }
 
 }  // namespace tao

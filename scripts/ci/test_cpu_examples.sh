@@ -11,14 +11,19 @@
 
 set -ex
 if [ ! -z "$CPU_ONLY" ]; then
+  if [[ -f ~/.cache/proxy_config ]]; then
+    source ~/.cache/proxy_config
+  fi
   # install disc python wheel
   python -m virtualenv venv && source venv/bin/activate
   arch=`uname -p`
   if [[ $arch == "aarch64" ]]; then
+    # higher version is not backward compatible.
+    pip install protobuf==3.20.1
     # TODO(disc): a workaround for issue #224
-    pip install https://hlomodule.oss-cn-zhangjiakou.aliyuncs.com/bladedisc/aarch64/tensorflow-2.8.0-cp38-cp38-linux_aarch64.whl
+    pip install https://pai-blade.oss-accelerate.aliyuncs.com/build_deps/tensorflow/2.8.0_py3.8.5_aarch64/tensorflow-2.8.0-cp38-cp38-linux_aarch64.whl
   fi
-  python -m pip install ./build/blade_disc*.whl
+  HTTPS_PROXY=${HTTPS_PROXY} python -m pip install ./build/blade_disc*.whl
 
   pushd examples/TensorFlow/Inference/X86/BERT
   bash download_model.sh

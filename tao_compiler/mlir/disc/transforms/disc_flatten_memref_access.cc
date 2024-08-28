@@ -17,15 +17,15 @@ limitations under the License.
 
 #include "llvm/Support/Debug.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
-#include "mlir/Dialect/SCF/SCF.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Location.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/Passes.h"
-#include "tensorflow/compiler/mlir/disc/IR/disc_shape_ops.h"
-#include "tensorflow/compiler/mlir/disc/transforms/PassDetail.h"
-#include "tensorflow/compiler/mlir/disc/transforms/codegen_utils.h"
-#include "tensorflow/compiler/mlir/disc/transforms/lhlo_elemental_utils.h"
+#include "mlir/disc/IR/disc_shape_ops.h"
+#include "mlir/disc/transforms/PassDetail.h"
+#include "mlir/disc/transforms/codegen_utils.h"
+#include "mlir/disc/transforms/lhlo_elemental_utils.h"
 
 namespace mlir {
 namespace disc_ral {
@@ -35,7 +35,7 @@ namespace {
 struct DiscFlattenMemrefAccessPass
     : DiscFlattenMemrefAccessPassBase<DiscFlattenMemrefAccessPass> {
   void runOnOperation() override {
-    FuncOp func = getOperation();
+    func::FuncOp func = getOperation();
 
     // Collect target load/store ops before rewrite to avoid modify while
     // traveling.
@@ -91,14 +91,15 @@ LogicalResult DiscFlattenMemrefAccessPass::processStoreOp(memref::StoreOp op) {
   SmallVector<Value> dimSizes = disc_ral::getShapeValues(&b, memref);
   Value linear = b.create<disc_shape::LinearizeOp>(loc, b.getIndexType(),
                                                    op.getIndices(), dimSizes);
-  disc_ral::createOffsetStore(b, loc, op.value(), memref, linear);
+  disc_ral::createOffsetStore(b, loc, op.getValue(), memref, linear);
   op->erase();
   return success();
 }
 
 }  // namespace
 
-std::unique_ptr<OperationPass<FuncOp>> createDiscFlattenMemrefAccessPass() {
+std::unique_ptr<OperationPass<func::FuncOp>>
+createDiscFlattenMemrefAccessPass() {
   return std::make_unique<DiscFlattenMemrefAccessPass>();
 }
 

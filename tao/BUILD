@@ -1,5 +1,5 @@
 load("@com_google_protobuf//:protobuf.bzl", "cc_proto_library")
-load("@local_config_tf//:build_defs.bzl", "tf_copts")
+load("@local_config_tf//:build_defs.bzl", "tf_copts", "tf_major_version")
 load("@local_config_cuda//cuda:build_defs.bzl", "cuda_library", "if_cuda")
 load("//:tao_bridge.bzl", "tao_bridge_cc_test")
 load("@local_config_blade_disc_helper//:build_defs.bzl",
@@ -10,8 +10,10 @@ load("@local_config_blade_disc_helper//:build_defs.bzl",
     "disc_build_ip",
     "disc_build_time",
     "if_platform_alibaba",
+    "if_internal_serving",
 )
 load("@org_tensorflow//tensorflow:tensorflow.bzl", "tf_cc_shared_object")
+load("@local_config_rocm//rocm:build_defs.bzl", "if_dcu", "if_rocm")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -38,7 +40,8 @@ genrule(
         sed -i 's/@TAO_BUILD_GIT_HEAD@/%s/g' $@;
         sed -i 's/@TAO_BUILD_HOST@/%s/g' $@;
         sed -i 's/@TAO_BUILD_IP@/%s/g' $@;
-        sed -i 's/@TAO_BUILD_TIME@/%s/g' $@
+        sed -i 's/@TAO_BUILD_TIME@/%s/g' $@;
+        chmod +w $@
     """ % (disc_build_version(), disc_build_git_branch(), disc_build_git_head(), disc_build_host(), disc_build_ip(), disc_build_time()),
 )
 
@@ -100,12 +103,32 @@ cc_library(
     ),
     deps = [
         ":version_header",
-        "@local_config_tf//:tf_header_lib",
-        "@local_config_tf//:libtensorflow_framework",
-        "@org_tao_compiler//tensorflow/compiler/mlir/xla/ral:ral_bridge",
-    ],
+        "@org_tao_compiler//mlir/custom_ops:disc_custom_ops_bridge",
+    ] + if_platform_alibaba([
+        "@blade_service_common//blade_service_common:blade_service_common_deps",
+    ]) + if_internal_serving(
+        [
+            "@org_tensorflow//tensorflow/core:lib",
+            "@org_tensorflow//tensorflow/core:framework",
+            "@org_tensorflow//tensorflow/core:core_cpu",
+            "@org_tensorflow//tensorflow/core:stream_executor_no_cuda",
+            "@org_tensorflow//tensorflow/stream_executor:stream_executor_impl",
+        ],
+        [
+            "@local_config_tf//:tf_header_lib",
+            "@local_config_tf//:libtensorflow_framework",
+        ]
+    ),
     copts = if_cuda([
-        "-DGOOGLE_CUDA=1",
+        "-DGOOGLE_CUDA=1"
+    ]) + if_dcu([
+        "-DTENSORFLOW_USE_DCU=1"
+    ]) + if_rocm([
+        "-DTENSORFLOW_USE_ROCM=1",
+        "-x rocm",
+    ]) + if_internal_serving([
+        "-DTF_1_12",
+        "-DIS_PAI_TF",
     ]) + tf_copts(),
     linkopts = [
         "-lm",
@@ -126,7 +149,22 @@ tf_cc_shared_object(
     deps = [
         ":tao_bridge",
         "//:bridge_version_scripts.lds",
+    ] + if_rocm([
+        "@local_config_rocm//rocm:rocblas",
+    ]),
+)
+
+genrule(
+    name = "lib_tao_serving_genrule",
+    srcs = [
+        ":libtao_ops.so"
     ],
+    outs = ["serving/libtao_ops.so"],
+    cmd = """
+        cp $(location :libtao_ops.so) $@;
+        chmod +w $@;
+        patchelf --remove-needed libtensorflow_framework.so.%s $@
+    """ % tf_major_version(),
 )
 
 tao_bridge_cc_test(
@@ -169,7 +207,6 @@ tao_bridge_cc_test(
     srcs = [
         "tao_bridge/passes/tao_clone_constants_for_better_clustering_test.cc",
         "tao_bridge/passes/tao_defuse_pass_test.cc",
-        "tao_bridge/passes/tao_remove_small_cluster_pass_test.cc",
     ],
     tags = ["cpu"],
 )

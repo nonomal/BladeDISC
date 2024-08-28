@@ -10,51 +10,50 @@
 # limitations under the License.
 
 # type: ignore
-import fnmatch
+import glob
 import os
 import re
-import subprocess
 import sys
-from itertools import chain
-from typing import List
-
+import subprocess
 import setuptools
+from setuptools import Extension, Command
+from setuptools.command.build_ext import build_ext
 from setuptools.command.build_py import build_py
+from Cython.Build import cythonize
 
 from version import __version__
 
-SKIP_TRT = os.environ.get('SKIP_TRT').lower() == 'true'
+
+def _get_device():
+    # To get device info from bazel configuration.
+    # Another option is to retrieve from TensorFlow API. But since we may build GPU
+    # package in a docker container with no GPU device mounted, tf.test.is_gpu_available
+    # becomes not suitable. Reading from generated bazel configuration file to keep
+    # consistent with C++ part.
+    with open("./.bazelrc_gen", "r") as f:
+        devices = []
+        for line in f:
+            line = line.strip()
+            if 'build --config=cuda' == line:
+                devices.append('gpu')
+            elif 'build --config=cpu' == line:
+                devices.append('cpu')
+        assert (
+            len(devices) == 1
+        ), f"Multiple devices detected from .bazelrc_gen file: {devices}"
+        return devices[0]
 
 
-def get_tf_blade_files() -> List[str]:
-    """
-    Just list all files under tf_blade and all .so files under other directoies. Bazel
-    helps to put native files on correct place.
-    """
-    res = []
-    for root, dirs, files in os.walk('tf_blade/'):
-        root = root[len('tf_blade/') :]
-        for fname in files:
-            if '.so' in fname or '.so.' in fname:
-                res.append(os.path.join(root, fname))
-    return res
+DEVICE = _get_device()
+
+def get_install_requires():
+    install_requires = ['numpy', 'onnx>=1.6']
+    if DEVICE == 'gpu':
+        install_requires.extend(['tf2onnx>=1.9.1'])
+    return install_requires
 
 
-device = os.environ.get('PKG_DEVICE', 'gpu').lower()
-if device is not None:
-    if device not in ['cpu', 'gpu']:
-        raise Exception("The device must be in choice of ['cpu', 'gpu']")
-
-install_requires = [
-    'numpy',
-    'onnx>=1.6',
-]
-
-if device == 'gpu':
-    install_requires.extend(['tf2onnx>=1.9.1'])
-
-
-def get_version(device):  # noqa: C901
+def _get_version():  # noqa: C901
     tf_version = ''
     try:
         import tensorflow.compat.v1 as tf
@@ -68,7 +67,7 @@ def get_version(device):  # noqa: C901
         except ModuleNotFoundError:
             pass
 
-    if device == 'gpu':
+    if DEVICE == 'gpu':
         if os.path.exists('/usr/local/cuda/version.txt'):
             with open('/usr/local/cuda/version.txt', 'r') as f:
                 full_version_info = f.read()
@@ -88,7 +87,7 @@ def get_version(device):  # noqa: C901
             if len(tf_version) == 0:
                 raise Exception("Failed to get tf version")
             else:
-                return f'+cu{major_minor}_{tf_version}'
+                return f'+cu{major_minor}.{tf_version}'
         raise Exception("Failed to get cuda version")
     else:
         if len(tf_version) != 0:
@@ -96,27 +95,122 @@ def get_version(device):  # noqa: C901
         else:
             raise Exception("Failed to get tf version")
 
-is_develop = 'develop' in sys.argv
-print("IS DEVELOP MODE: ", is_develop)
 
-packages = setuptools.find_packages(
-    exclude=['src', 'src.*']
-)
+class CppBuild(build_ext):
+    def run(self):
+        assert isinstance(self.extensions[0], TfBladeExtension)
+        ext = self.extensions[0]
+        extdir = os.path.abspath(os.path.dirname(self.get_ext_fullpath(ext.name)))
 
-package_data = {
-    "tf_blade": get_tf_blade_files(),
-}
+        # bazel build tf_blade extension.
+        subprocess.check_call(
+            "bazel build //src:_tf_blade.so", shell=True, executable="/bin/bash"
+        )
+        lib_pat = re.compile(r".+\.so(\.[0-9]+)?$")
+        BIN_LIST = ['hie_serialize']
+
+        # remove old links.
+        for fname in os.listdir(extdir):
+            if lib_pat.match(fname) or fname in BIN_LIST:
+                full_path = os.path.join(extdir, fname)
+                if os.path.islink(full_path):
+                    os.remove(full_path)
+                    print(f"Unlink native lib: {full_path}")
+
+        # link native libraries.
+        bazel_bin_dir = os.path.join(ext.sourcedir, "bazel-bin")
+        for search_dir in ['src', os.path.join('src', 'internal')]:
+            for fpath in glob.glob(os.path.join(bazel_bin_dir, search_dir, '*')):
+                fname = os.path.basename(fpath)
+                if lib_pat.match(fpath) or fname in BIN_LIST:
+                    link_name = os.path.join(extdir, fname)
+                    if os.path.exists(link_name):
+                        os.remove(link_name)
+                    os.symlink(fpath, link_name)
+                    print(f"Link native lib: {fpath}")
+
+        # link internal disc.
+        import tensorflow as tf
+        compiler_fname = 'tao_compiler_main'
+        compiler_bin = os.path.join(
+            os.path.dirname(tf.__file__), os.path.pardir, 'aicompiler', compiler_fname)
+        compiler_bin = os.path.abspath(compiler_bin)
+        if os.path.exists(compiler_bin):
+            link_name = os.path.join(extdir, compiler_fname)
+            if os.path.exists(link_name):
+                os.remove(link_name)
+            os.symlink(compiler_bin, link_name)
+
+        # other extensions
+        self.extensions.pop(0)
+        super().run()
+
+
+class CppTestCommand(Command):
+    user_options = []
+
+    def initialize_options(self):
+        pass
+
+    def finalize_options(self):
+        pass
+
+    def run(self):
+        filter = "-cpu" if DEVICE == "gpu" else "-gpu"
+        subprocess.check_call(
+            f"bazel test //src/... --build_tests_only --test_tag_filters={filter}",
+            shell=True,
+            executable="/bin/bash",
+        )
+
+
+class TfBladeExtension(Extension):
+    def __init__(self, name, sourcedir=""):
+        Extension.__init__(self, name, sources=[])
+        self.sourcedir = os.path.abspath(sourcedir)
+
+
+ext_modules = [TfBladeExtension("tf_blade._tf_blade")]
+exclude_py_mods = []
+if 'develop' not in sys.argv and os.path.exists('tf_blade/internal'):
+    cython_modules = cythonize(
+            module_list=['tf_blade/internal/**/*.py'],
+            compiler_directives={'language_level': 3},
+            build_dir="build",
+            nthreads=8
+            )
+    exclude_py_mods = [m.name for m in cython_modules]
+    ext_modules.extend(cython_modules)
+
+
+class PyBuild(build_py):
+    """ Just to exclude cythonized .py files."""
+
+    def find_modules(self):
+        modules = super().find_modules()
+        return [
+            (pkg, mod, file,)
+            for pkg, mod, file in modules
+            if pkg + '.' + mod not in exclude_py_mods
+        ]
+
+    def find_package_modules(self, package: str, package_dir: str):
+        modules = super().find_package_modules(package, package_dir)
+        return [
+            (pkg, mod, file,)
+            for pkg, mod, file in modules
+            if pkg + '.' + mod not in exclude_py_mods
+        ]
+
 
 setuptools.setup(
-    name="tensorflow-blade-" + device,
-    version=(__version__ + get_version(device)),
+    name="tensorflow-blade-" + DEVICE,
+    version=(__version__ + _get_version()),
     author="Alibaba PAI Team",
-    # TODO(xiafei.qiuxf): need a public email address.
-    # author_email="author@example.com",
     description="TensorFlow-Blade is a general automatic inference optimization system.",
-    packages=packages,
-    package_data=package_data,
-    install_requires=install_requires,
+    packages=setuptools.find_packages(exclude=['src', 'src.*', 'tests', 'tests.*']),
+    package_data={'tf_blade': ['py.typed']},
+    install_requires=get_install_requires(),
     classifiers=[
         "Topic :: Scientific/Engineering",
         "Topic :: Scientific/Engineering :: Mathematics",
@@ -126,6 +220,6 @@ setuptools.setup(
         "Topic :: Software Development :: Libraries :: Python Modules",
     ],
     python_requires='>=3.6',
-    ext_modules=[],
-    cmdclass={},
+    ext_modules=ext_modules,
+    cmdclass=dict(build_ext=CppBuild, cpp_test=CppTestCommand, build_py=PyBuild),
 )

@@ -9,7 +9,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "tensorflow/compiler/mlir/disc/tests/mlir_test.h"
+#include "mlir/disc/tests/mlir_test.h"
 
 #include <dlfcn.h>
 
@@ -27,14 +27,15 @@
 #endif
 
 #if defined(GOOGLE_CUDA) || defined(TENSORFLOW_USE_ROCM)
-#include "tensorflow/compiler/mlir/xla/ral/context/base/cuda/cuda_context_impl.h"
+#include "mlir/ral/context/base/cuda/cuda_context_impl.h"
 #else
 // TODO(disc): figure out why the bazel does not trigger re-compile this file
 // after we update ral.
-#include "tensorflow/compiler/mlir/xla/ral/context/base/cpu/cpu_context_impl.h"
+//
+#include "mlir/ral/context/base/cpu/cpu_context_impl.h"
 #endif
 
-#include "tensorflow/compiler/mlir/xla/ral/ral_api.h"
+#include "mlir/ral/ral_api.h"
 #include "tensorflow/core/framework/graph.pb.h"
 #include "tensorflow/core/framework/tensor.h"
 #include "tensorflow/core/framework/tensor_shape.h"
@@ -65,11 +66,13 @@ using ::stream_executor::gpu::GpuStatus;
 #define GPU_MEMCPYDTOH_API tensorflow::wrap::hipMemcpyDtoH
 #define GPU_MEMCPYHTOD_API tensorflow::wrap::hipMemcpyHtoD
 #define GPU_MALLOC_API tensorflow::wrap::hipMalloc
+#define GPU_FREE_API tensorflow::wrap::hipFree
 #else
 #define GPU_SUCCESS CUDA_SUCCESS
 #define GPU_MEMCPYDTOH_API cuMemcpyDtoH
 #define GPU_MEMCPYHTOD_API cuMemcpyHtoD
 #define GPU_MALLOC_API cuMemAlloc
+#define GPU_FREE_API cuMemFree
 #endif
 
 DataType ParseDataType(const std::string& s) {
@@ -89,6 +92,12 @@ DataType ParseDataType(const std::string& s) {
     return tensorflow::DT_UINT8;
   } else if (s == "i8") {
     return tensorflow::DT_INT8;
+  } else if (s == "qi8") {
+    return tensorflow::DT_QINT8;
+  } else if (s == "qui8") {
+    return tensorflow::DT_QUINT8;
+  } else if (s == "qi32") {
+    return tensorflow::DT_QINT32;
   } else {
     LOG(ERROR) << "Error: unsupported input/output element type " << s;
     return tensorflow::DT_INVALID;
@@ -160,6 +169,14 @@ static int32_t reportErrorIfAny(GpuStatus result, const char* where) {
   printErrorIfAny(result, where);
   return result;
 }
+static void gpu_dealloc(void* buffer) {
+#if TENSORFLOW_USE_ROCM
+  reportErrorIfAny(GPU_FREE_API(absl::bit_cast<hipDeviceptr_t>(buffer)),
+                   "hipFree");
+#else
+  reportErrorIfAny(GPU_FREE_API(CUdeviceptr(buffer)), "cuMemFree");
+#endif
+}
 #endif
 
 void print_output_shape(void* d_result, const buffer_shape_t& shape) {
@@ -179,6 +196,7 @@ MlirTest::MlirTest(const std::string& mlir_file_path,
                    const std::vector<std::vector<float>>& input_vals,
                    const std::vector<DataType>& out_elem_types,
                    const std::vector<DeviceType>& output_placement,
+                   const std::vector<tensorflow::Tensor>& expected_output_vals,
                    bool profiling, bool multi_cc_mode,
                    bool multi_cc_mode_dbg_ptx_only)
     : mlir_file_path_(mlir_file_path),
@@ -192,24 +210,27 @@ MlirTest::MlirTest(const std::string& mlir_file_path,
       input_vals_(input_vals),
       out_elem_types_(out_elem_types),
       output_placement_(output_placement),
+      expected_output_vals_(expected_output_vals),
       h_data_(num_inputs),
       actual_results_(num_outputs),
       profiling_(profiling),
       multi_cc_mode_(multi_cc_mode),
       multi_cc_mode_dbg_ptx_only_(multi_cc_mode_dbg_ptx_only) {
-  ReadStringFromEnvVar("TF_OPT_PATH", "tensorflow/compiler/mlir/tf-opt",
-                       &tf_opt_path_);
+  ReadStringFromEnvVar(
+      "TF_OPT_PATH", "external/org_tensorflow/tensorflow/compiler/mlir/tf-opt",
+      &tf_opt_path_);
 
   ReadStringFromEnvVar("DHLO_COMPILER_MAIN_PATH",
-                       "tensorflow/compiler/mlir/disc/disc_compiler_main",
+                       "mlir/disc/disc_compiler_main",
                        &dhlo_compiler_main_path_);
 
-  ReadStringFromEnvVar("TF_MLIR_TRANSLATE_PATH",
-                       "tensorflow/compiler/mlir/tf-mlir-translate",
-                       &tf_mlir_translate_path_);
+  ReadStringFromEnvVar(
+      "TF_MLIR_TRANSLATE_PATH",
+      "external/org_tensorflow/tensorflow/compiler/mlir/tf-mlir-translate",
+      &tf_mlir_translate_path_);
 
   compiled_so_file_ = tmp_dir_ + test_name_ + ".so";
-
+  VLOG(0) << "tf_opt_pat: " << tf_opt_path_;
   VLOG(0) << "mlir_file_path: " << mlir_file_path_;
   VLOG(0) << "tmp_dir: " << tmp_dir_;
   VLOG(0) << "test_name: " << test_name_;
@@ -217,9 +238,14 @@ MlirTest::MlirTest(const std::string& mlir_file_path,
 
 Status MlirTest::Run() {
   TF_RETURN_IF_ERROR(CompileMlirToBinary());
+  VLOG(0) << "run compiled program\n";
   TF_RETURN_IF_ERROR(GenerateInputAndRun());
-  TF_RETURN_IF_ERROR(RunGoldenTF());
-  return Status::OK();
+  if (expected_output_vals_.empty()) {
+    VLOG(0) << "run golden tf\n";
+    TF_RETURN_IF_ERROR(RunGoldenTF());
+  }
+  TF_RETURN_IF_ERROR(CompareResults());
+  return tsl::OkStatus();
 }
 
 int MlirTest::CallBinary(std::string program_path,
@@ -228,6 +254,7 @@ int MlirTest::CallBinary(std::string program_path,
   process.SetProgram(program_path, args);
   process.SetChannelAction(tensorflow::CHAN_STDOUT, tensorflow::ACTION_PIPE);
   process.SetChannelAction(tensorflow::CHAN_STDERR, tensorflow::ACTION_PIPE);
+  VLOG(0) << "program_path: " << program_path << "\n";
   if (!process.Start()) {
     return 1;
   }
@@ -245,6 +272,7 @@ int MlirTest::CallBinary(std::string program_path,
           << stdout_output << "\n============ END ============\n";
   VLOG(0) << "-- stderr:\n"
           << stderr_output << "\n============ END ============\n";
+  VLOG(0) << "ret: " << s << "\n";
   return s;
 }
 
@@ -253,6 +281,7 @@ Status MlirTest::CompileMlirToBinary() {
   std::string tf_dialect_file = tmp_dir_ + test_name_ + "_tf_dialect.mlir";
   std::vector<std::string> args = {tf_opt_path_, "--tf-standard-pipeline",
                                    mlir_file_path_, "-o", tf_dialect_file};
+  VLOG(0) << "tf_opt_path: " << tf_opt_path_ << "\n";
   if (CallBinary(tf_opt_path_, args)) {
     return Internal("tf_executor dialect -> tf dialect failed");
   }
@@ -278,7 +307,7 @@ Status MlirTest::CompileMlirToBinary() {
     return Internal("tf dialect -> compilation result failed");
   }
 
-  return Status::OK();
+  return tsl::OkStatus();
 }
 
 Status MlirTest::LoadGraph(const std::string& graph_file_name) {
@@ -301,9 +330,9 @@ Status MlirTest::LoadGraph(const std::string& graph_file_name) {
   Status session_create_status = sess_->Create(graph_def);
   if (!session_create_status.ok()) {
     return Internal("Error: create session failed" +
-                    session_create_status.error_message());
+                    session_create_status.ToString());
   }
-  return Status::OK();
+  return tsl::OkStatus();
 }
 
 // TODO: configurable relative/absolute error tolerance according to
@@ -324,7 +353,8 @@ bool MlirTest::IsAcceptableNear(T a, T b, double rel_err_limit,
 template <class T>
 static void InitializeTensor(const std::vector<T>& initialization_values,
                              Tensor* input_tensor) {
-  auto type_tensor = input_tensor->flat<T>();
+  auto type_tensor =
+      input_tensor->bit_casted_shaped<T, 1>({input_tensor->NumElements()});
   type_tensor = type_tensor.constant(static_cast<T>(0));
   if (!initialization_values.empty()) {
     for (int i = 0; i < initialization_values.size(); ++i) {
@@ -385,7 +415,8 @@ Status MlirTest::RunGoldenTF() {
       half* ptr = reinterpret_cast<half*>(h_data_[i].get());
       std::vector<half> h_data_vec(ptr, ptr + num_elements);
       InitializeTensor<half>(h_data_vec, &input_tensor);
-    } else if (dtype == tensorflow::DT_INT32) {
+    } else if (dtype == tensorflow::DT_INT32 ||
+               dtype == tensorflow::DT_QINT32) {
       int32_t* ptr = reinterpret_cast<int32_t*>(h_data_[i].get());
       std::vector<int32_t> h_data_vec(ptr, ptr + num_elements);
       InitializeTensor<int32_t>(h_data_vec, &input_tensor);
@@ -398,11 +429,12 @@ Status MlirTest::RunGoldenTF() {
       bool* ptr = reinterpret_cast<bool*>(h_data_[i].get());
       std::vector<bool> h_data_vec(ptr, ptr + num_elements);
       InitializeTensor<bool>(h_data_vec, &input_tensor);
-    } else if (dtype == tensorflow::DT_UINT8) {
+    } else if (dtype == tensorflow::DT_UINT8 ||
+               dtype == tensorflow::DT_QUINT8) {
       uint8_t* ptr = reinterpret_cast<uint8_t*>(h_data_[i].get());
       std::vector<uint8_t> h_data_vec(ptr, ptr + num_elements);
       InitializeTensor<uint8_t>(h_data_vec, &input_tensor);
-    } else if (dtype == tensorflow::DT_INT8) {
+    } else if (dtype == tensorflow::DT_INT8 || dtype == tensorflow::DT_QINT8) {
       int8_t* ptr = reinterpret_cast<int8_t*>(h_data_[i].get());
       std::vector<int8_t> h_data_vec(ptr, ptr + num_elements);
       InitializeTensor<int8_t>(h_data_vec, &input_tensor);
@@ -443,13 +475,18 @@ Status MlirTest::RunGoldenTF() {
     }
   }
 
+  expected_output_vals_ = std::move(output_tensors);
+  return tsl::OkStatus();
+}
+
+Status MlirTest::CompareResults() {
   for (int64_t i = 0; i < num_outputs_; ++i) {
     VLOG(0) << "processing output " << i;
     DataType dtype = out_elem_types_[i];
     std::string msg = "Error in output ";
     absl::StrAppend(&msg, i, ":\n");
     if (dtype == tensorflow::DT_FLOAT) {
-      auto datas = output_tensors[i].flat<float>();
+      auto datas = expected_output_vals_[i].flat<float>();
       for (int64_t n = 0; n < datas.size(); ++n) {
         float actual = reinterpret_cast<float*>(actual_results_[i].get())[n];
         VLOG(2) << "  expected: " << datas(n) << ", actual: " << actual;
@@ -460,7 +497,7 @@ Status MlirTest::RunGoldenTF() {
         }
       }
     } else if (dtype == tensorflow::DT_DOUBLE) {
-      auto datas = output_tensors[i].flat<double>();
+      auto datas = expected_output_vals_[i].flat<double>();
       for (int64_t n = 0; n < datas.size(); ++n) {
         double actual = reinterpret_cast<double*>(actual_results_[i].get())[n];
         VLOG(2) << "  expected: " << datas(n) << ", actual: " << actual;
@@ -472,7 +509,7 @@ Status MlirTest::RunGoldenTF() {
         }
       }
     } else if (dtype == tensorflow::DT_HALF) {
-      auto datas = output_tensors[i].flat<half>();
+      auto datas = expected_output_vals_[i].flat<half>();
       for (int64_t n = 0; n < datas.size(); ++n) {
         half actual = reinterpret_cast<half*>(actual_results_[i].get())[n];
         VLOG(2) << "  expected: " << datas(n) << ", actual: " << actual;
@@ -483,8 +520,12 @@ Status MlirTest::RunGoldenTF() {
           return Internal(msg);
         }
       }
-    } else if (dtype == tensorflow::DT_INT32) {
-      auto datas = output_tensors[i].flat<int32_t>();
+    } else if (dtype == tensorflow::DT_INT32 ||
+               dtype == tensorflow::DT_QINT32) {
+      // Using bitcast instead of `flat` in case the output has quantized
+      // integer type.
+      auto datas = expected_output_vals_[i].bit_casted_shaped<int32_t, 1>(
+          {expected_output_vals_[i].NumElements()});
       for (int64_t n = 0; n < datas.size(); ++n) {
         int32_t actual =
             reinterpret_cast<int32_t*>(actual_results_[i].get())[n];
@@ -496,7 +537,7 @@ Status MlirTest::RunGoldenTF() {
         }
       }
     } else if (dtype == tensorflow::DT_INT64) {
-      auto datas = output_tensors[i].flat<tensorflow::int64>();
+      auto datas = expected_output_vals_[i].flat<tensorflow::int64>();
       for (int64_t n = 0; n < datas.size(); ++n) {
         tensorflow::int64 actual =
             reinterpret_cast<int64_t*>(actual_results_[i].get())[n];
@@ -508,7 +549,7 @@ Status MlirTest::RunGoldenTF() {
         }
       }
     } else if (dtype == tensorflow::DT_BOOL) {
-      auto datas = output_tensors[i].flat<bool>();
+      auto datas = expected_output_vals_[i].flat<bool>();
       for (int64_t n = 0; n < datas.size(); ++n) {
         bool actual = reinterpret_cast<bool*>(actual_results_[i].get())[n];
         VLOG(2) << "expected: " << datas(n) << ", actual: " << actual;
@@ -519,8 +560,12 @@ Status MlirTest::RunGoldenTF() {
           return Internal(msg);
         }
       }
-    } else if (dtype == tensorflow::DT_UINT8) {
-      auto datas = output_tensors[i].flat<uint8_t>();
+    } else if (dtype == tensorflow::DT_UINT8 ||
+               dtype == tensorflow::DT_QUINT8) {
+      // Using bitcast instead of `flat` in case the output has quantized
+      // integer type.
+      auto datas = expected_output_vals_[i].bit_casted_shaped<uint8_t, 1>(
+          {expected_output_vals_[i].NumElements()});
       for (int64_t n = 0; n < datas.size(); ++n) {
         uint8_t actual =
             reinterpret_cast<uint8_t*>(actual_results_[i].get())[n];
@@ -531,8 +576,11 @@ Status MlirTest::RunGoldenTF() {
           return Internal(msg);
         }
       }
-    } else if (dtype == tensorflow::DT_INT8) {
-      auto datas = output_tensors[i].flat<int8_t>();
+    } else if (dtype == tensorflow::DT_INT8 || dtype == tensorflow::DT_QINT8) {
+      // Using bitcast instead of `flat` in case the output has quantized
+      // integer type.
+      auto datas = expected_output_vals_[i].bit_casted_shaped<int8_t, 1>(
+          {expected_output_vals_[i].NumElements()});
       for (int64_t n = 0; n < datas.size(); ++n) {
         int8_t actual = reinterpret_cast<int8_t*>(actual_results_[i].get())[n];
         VLOG(2) << "expected: " << datas(n) << ", actual: " << actual;
@@ -546,26 +594,24 @@ Status MlirTest::RunGoldenTF() {
       return Internal("Error: unexpected output tensor dtype");
     }
   }
-
-  return Status::OK();
+  return tsl::OkStatus();
 }
 
-MlirTestImpl::MlirTestImpl(const std::string& mlir_file_path,
-                           const std::string& tmp_dir,
-                           const std::string& test_name, int num_inputs,
-                           int num_outputs,
-                           const std::vector<buffer_shape_t>& input_shapes,
-                           const std::vector<DataType>& input_elem_types,
-                           const std::vector<DeviceType>& input_placement,
-                           const std::vector<std::vector<float>>& input_vals,
-                           const std::vector<DataType>& out_elem_types,
-                           const std::vector<DeviceType>& output_placement,
-                           bool profiling, bool multi_cc_mode,
-                           bool multi_cc_mode_dbg_ptx_only)
+MlirTestImpl::MlirTestImpl(
+    const std::string& mlir_file_path, const std::string& tmp_dir,
+    const std::string& test_name, int num_inputs, int num_outputs,
+    const std::vector<buffer_shape_t>& input_shapes,
+    const std::vector<DataType>& input_elem_types,
+    const std::vector<DeviceType>& input_placement,
+    const std::vector<std::vector<float>>& input_vals,
+    const std::vector<DataType>& out_elem_types,
+    const std::vector<DeviceType>& output_placement,
+    const std::vector<tensorflow::Tensor>& expected_output_vals, bool profiling,
+    bool multi_cc_mode, bool multi_cc_mode_dbg_ptx_only)
     : MlirTest(mlir_file_path, tmp_dir, test_name, num_inputs, num_outputs,
                input_shapes, input_elem_types, input_placement, input_vals,
-               out_elem_types, output_placement, profiling, multi_cc_mode,
-               multi_cc_mode_dbg_ptx_only) {
+               out_elem_types, output_placement, expected_output_vals,
+               profiling, multi_cc_mode, multi_cc_mode_dbg_ptx_only) {
   tao_ral_func_ptr_ = reinterpret_cast<void*>(&tao_ral_call_impl);
   if (!tao_ral_func_ptr_) {
     LOG(ERROR) << "Error: fail to find tao_ral_call_impl";
@@ -669,7 +715,8 @@ Status MlirTestImpl::GenerateInputAndRun() {
         }
       }
 
-    } else if (dtype == tensorflow::DT_INT32) {
+    } else if (dtype == tensorflow::DT_INT32 ||
+               dtype == tensorflow::DT_QINT32) {
       bytes = nelem * sizeof(int32_t);
       h_data_[idx] = std::shared_ptr<void>(new int32_t[nelem], [](void* p) {
         delete[] reinterpret_cast<int32_t*>(p);
@@ -723,7 +770,8 @@ Status MlirTestImpl::GenerateInputAndRun() {
         }
       }
 
-    } else if (dtype == tensorflow::DT_UINT8) {
+    } else if (dtype == tensorflow::DT_UINT8 ||
+               dtype == tensorflow::DT_QUINT8) {
       bytes = nelem * sizeof(uint8_t);
       h_data_[idx] = std::shared_ptr<void>(new uint8_t[nelem], [](void* p) {
         delete[] reinterpret_cast<uint8_t*>(p);
@@ -740,7 +788,7 @@ Status MlirTestImpl::GenerateInputAndRun() {
           m = (m + 1) % nelem;
         }
       }
-    } else if (dtype == tensorflow::DT_INT8) {
+    } else if (dtype == tensorflow::DT_INT8 || dtype == tensorflow::DT_QINT8) {
       bytes = nelem * sizeof(int8_t);
       h_data_[idx] = std::shared_ptr<void>(new int8_t[nelem], [](void* p) {
         delete[] reinterpret_cast<int8_t*>(p);
@@ -782,15 +830,17 @@ Status MlirTestImpl::GenerateInputAndRun() {
       bytes = nelem * sizeof(double);
     } else if (dtype == tensorflow::DT_HALF) {
       bytes = nelem * sizeof(half);
-    } else if (dtype == tensorflow::DT_INT32) {
+    } else if (dtype == tensorflow::DT_INT32 ||
+               dtype == tensorflow::DT_QINT32) {
       bytes = nelem * sizeof(int32_t);
     } else if (dtype == tensorflow::DT_INT64) {
       bytes = nelem * sizeof(int64_t);
     } else if (dtype == tensorflow::DT_BOOL) {
       bytes = nelem * sizeof(bool);
-    } else if (dtype == tensorflow::DT_UINT8) {
+    } else if (dtype == tensorflow::DT_UINT8 ||
+               dtype == tensorflow::DT_QUINT8) {
       bytes = nelem * sizeof(uint8_t);
-    } else if (dtype == tensorflow::DT_INT8) {
+    } else if (dtype == tensorflow::DT_INT8 || dtype == tensorflow::DT_QINT8) {
       bytes = nelem * sizeof(int8_t);
     }
     void* d_addr = nullptr;
@@ -963,7 +1013,8 @@ Status MlirTestImpl::GenerateInputAndRun() {
         actual_results_[idx] = std::shared_ptr<void>(
             h_result, [](void* p) { delete[] reinterpret_cast<half*>(p); });
       }
-    } else if (out_elem_types_[idx] == tensorflow::DT_INT32) {
+    } else if (out_elem_types_[idx] == tensorflow::DT_INT32 ||
+               out_elem_types_[idx] == tensorflow::DT_QINT32) {
       if (output_placement_[idx] == DeviceType::kCPU) {
         for (int i = 0; i < nelem; ++i) {
           VLOG(2) << "  result #" << i << ": "
@@ -1029,7 +1080,8 @@ Status MlirTestImpl::GenerateInputAndRun() {
         actual_results_[idx] = std::shared_ptr<void>(
             h_result, [](void* p) { delete[] reinterpret_cast<bool*>(p); });
       }
-    } else if (out_elem_types_[idx] == tensorflow::DT_UINT8) {
+    } else if (out_elem_types_[idx] == tensorflow::DT_UINT8 ||
+               out_elem_types_[idx] == tensorflow::DT_QUINT8) {
       if (output_placement_[idx] == DeviceType::kCPU) {
         for (int i = 0; i < nelem; ++i) {
           VLOG(2) << "  result #" << i << ": "
@@ -1051,7 +1103,8 @@ Status MlirTestImpl::GenerateInputAndRun() {
         actual_results_[idx] = std::shared_ptr<void>(
             h_result, [](void* p) { delete[] reinterpret_cast<uint8_t*>(p); });
       }
-    } else if (out_elem_types_[idx] == tensorflow::DT_INT8) {
+    } else if (out_elem_types_[idx] == tensorflow::DT_INT8 ||
+               out_elem_types_[idx] == tensorflow::DT_QINT8) {
       if (output_placement_[idx] == DeviceType::kCPU) {
         for (int i = 0; i < nelem; ++i) {
           VLOG(2) << "  result #" << i << ": "
@@ -1097,7 +1150,8 @@ Status MlirTestImpl::GenerateInputAndRun() {
         VLOG(2) << "  result #" << i << ": "
                 << reinterpret_cast<half*>(result)[i];
       }
-    } else if (out_elem_types_[idx] == tensorflow::DT_INT32) {
+    } else if (out_elem_types_[idx] == tensorflow::DT_INT32 ||
+               out_elem_types_[idx] == tensorflow::DT_QINT32) {
       for (int i = 0; i < nelem; ++i) {
         VLOG(2) << "  result #" << i << ": "
                 << reinterpret_cast<int32_t*>(result)[i];
@@ -1112,12 +1166,14 @@ Status MlirTestImpl::GenerateInputAndRun() {
         VLOG(2) << "  result #" << i << ": "
                 << reinterpret_cast<bool*>(result)[i];
       }
-    } else if (out_elem_types_[idx] == tensorflow::DT_UINT8) {
+    } else if (out_elem_types_[idx] == tensorflow::DT_UINT8 ||
+               out_elem_types_[idx] == tensorflow::DT_QUINT8) {
       for (int i = 0; i < nelem; ++i) {
         VLOG(2) << "  result #" << i << ": "
                 << reinterpret_cast<uint8_t*>(result)[i];
       }
-    } else if (out_elem_types_[idx] == tensorflow::DT_INT8) {
+    } else if (out_elem_types_[idx] == tensorflow::DT_INT8 ||
+               out_elem_types_[idx] == tensorflow::DT_QINT8) {
       for (int i = 0; i < nelem; ++i) {
         VLOG(2) << "  result #" << i << ": "
                 << reinterpret_cast<int8_t*>(result)[i];
@@ -1128,7 +1184,17 @@ Status MlirTestImpl::GenerateInputAndRun() {
     }
 #endif
   }
-  return Status::OK();
+
+#if defined(GOOGLE_CUDA) || defined(TENSORFLOW_USE_ROCM)
+  for (int idx = 0; idx < num_inputs_; ++idx) {
+    if (input_placement_[idx] != DeviceType::kCPU &&
+        d_addr_vec[idx] != nullptr) {
+      gpu_dealloc(d_addr_vec[idx]);
+    }
+  }
+#endif
+
+  return tsl::OkStatus();
 }
 
 }  //  namespace mlir_test

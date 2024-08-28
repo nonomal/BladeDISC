@@ -117,7 +117,6 @@ class BuildDepsCommand(CustomCommand):
         cmd = "python3 ../scripts/python/common_setup.py"
         if torch._C._GLIBCXX_USE_CXX11_ABI:
             cmd += " --cxx11_abi"
-
         if not build.cuda_available:
             cmd += " --cpu_only"
 
@@ -125,8 +124,29 @@ class BuildDepsCommand(CustomCommand):
 
 
 install_requires = ["networkx", "onnx>=1.6.0", f"torch=={torch.__version__}"]
+custom_install_requires = os.getenv("TORCH_BLADE_CUSTOM_INSTALL_REQUIRES", None)
+if custom_install_requires is not None:
+    # TORCH_BLADE_CUSTOM_INSTALL_REQUIRES shoud be something like:
+    # package1,package2,package3, ....
+    custom_install_requires = custom_install_requires.split(',')
+    install_requires.extend(custom_install_requires)
 
-wheel_suffix = "" if build.cuda_available else "-cpu"
+is_enable_neural_engine = os.getenv("TORCH_BLADE_ENABLE_NEURAL_ENGINE", None)
+if is_enable_neural_engine is not None:
+    install_requires.extend(["intel-extension-for-transformers",])
+
+if build.dcu_rocm_available:
+    wheel_suffix = "-dcu"
+elif build.cuda_available:
+    wheel_suffix = ""
+else:
+    wheel_suffix = "-cpu"
+
+torch_major_version, torch_minor_version = torch.__version__.split(".")[:2]
+torch_major_version = int(torch_major_version)
+torch_minor_version = int(torch_minor_version)
+
+ext_modules = [TorchBladeExtension("torch_blade._torch_blade")]
 
 setup(
     name=wheel_name + wheel_suffix,
@@ -135,7 +155,7 @@ setup(
     description="The pytorch blade project",
     install_requires=install_requires,
     packages=find_packages(exclude=["tests", "tests.*"]),
-    ext_modules=[TorchBladeExtension("torch_blade._torch_blade"), TorchBladeExtension("torch_disc._torch_disc")],
+    ext_modules=ext_modules,
     cmdclass=dict(
         build_ext=TorchBladeBuild,
         test=TestCommand,

@@ -20,3 +20,22 @@ def DiscHloLegalizeToLhloPass : Pass<"disc-hlo-legalize-to-lhlo", "ModuleOp"> {
   let constructor = "createDiscLegalizeToLhloPass()";
 }
 
+def DiscLhloRewriterPass: Pass<"disc-lhlo-rewriter", "ModuleOp"> {
+  let summary = "rewrite lmhlo ops to lmhlo_disc ops.";
+  let constructor = "createDiscLhloRewriterPass()";
+}
+
+def DiscOptimizationBarrierExpandPass : Pass<"disc-optimization-barrier-expand", "ModuleOp"> {
+  let summary = "Expand OptimizationBarrierOp";
+  let constructor = "createDiscOptimizationBarrierExpandPass()";
+}
+
+def DiscArgsMutationExpandPass : Pass<"disc-argsmutation-expand", "ModuleOp"> {
+  let summary = "Expand ArgsMutationOp";
+  let constructor = "createDiscArgsMutationExpandPass()";
+}
+
+def DiscOpSchedulePass : Pass<"disc-op-schedule", "ModuleOp"> {
+  let summary = "Schedule ops in a function";
+  let constructor = "createDiscOpSchedulePass()";
+}

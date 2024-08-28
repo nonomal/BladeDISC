@@ -15,15 +15,10 @@ limitations under the License.
 
 // This file defines the operations used in the DISC RAL dialect.
 
-#include "tensorflow/compiler/mlir/disc/IR/disc_ral_ops.h"
+#include "mlir/disc/IR/disc_ral_ops.h"
 
 namespace mlir {
 namespace disc_ral {
-
-template <typename T>
-static LogicalResult Verify(T op) {
-  return success();
-}
 
 //===----------------------------------------------------------------------===//
 // ral Dialect Constructor
@@ -33,7 +28,7 @@ RalDialect::RalDialect(MLIRContext* context)
     : Dialect(getDialectNamespace(), context, TypeID::get<RalDialect>()) {
   addOperations<
 #define GET_OP_LIST
-#include "tensorflow/compiler/mlir/disc/IR/disc_ral_ops.cc.inc"
+#include "mlir/disc/IR/disc_ral_ops.cc.inc"
       >();
   addTypes<RalExecutionContextType>();
   context->loadDialect<memref::MemRefDialect>();
@@ -61,4 +56,4 @@ void RalDialect::printType(Type type, DialectAsmPrinter& os) const {
 }  // namespace mlir
 
 #define GET_OP_CLASSES
-#include "tensorflow/compiler/mlir/disc/IR/disc_ral_ops.cc.inc"
+#include "mlir/disc/IR/disc_ral_ops.cc.inc"

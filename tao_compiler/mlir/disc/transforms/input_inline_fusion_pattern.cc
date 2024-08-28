@@ -9,14 +9,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "tensorflow/compiler/mlir/disc/transforms/input_inline_fusion_pattern.h"
+#include "mlir/disc/transforms/input_inline_fusion_pattern.h"
 
-#include "mlir-hlo/Dialect/lhlo/transforms/map_lmhlo_to_scalar_op.h"
+#include "lhlo/transforms/map_lmhlo_to_scalar_op.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/PatternMatch.h"
-#include "tensorflow/compiler/mlir/disc/disc_util.h"
-#include "tensorflow/compiler/mlir/disc/transforms/codegen_utils.h"
+#include "mlir/disc/IR/lhlo_disc_ops.h"
+#include "mlir/disc/disc_util.h"
+#include "mlir/disc/transforms/codegen_utils.h"
 
 namespace mlir {
 namespace disc_ral {
@@ -76,25 +77,25 @@ bool miscFuseHelper(PatternRewriter& rewriter, Operation* user,
 }
 
 template <>
-bool miscFuseHelper<ConstOp>(PatternRewriter& rewriter, Operation* user,
-                             Operation* producer, memref::LoadOp load_op,
-                             const SmallVector<memref::LoadOp>& load_ops,
-                             LowerConfig* lower_config) {
-  if (!isa<ConstOp>(producer)) return false;
-  auto constant = cast<lmhlo::ConstOp>(producer);
-  auto memref_type = constant.output().getType().cast<MemRefType>();
-  bool is_splat = constant.value().isSplat();
+bool miscFuseHelper<ConstantOp>(PatternRewriter& rewriter, Operation* user,
+                                Operation* producer, memref::LoadOp load_op,
+                                const SmallVector<memref::LoadOp>& load_ops,
+                                LowerConfig* lower_config) {
+  if (!isa<ConstantOp>(producer)) return false;
+  auto constant = cast<lmhlo::ConstantOp>(producer);
+  auto memref_type = constant.getOutput().getType().cast<MemRefType>();
+  bool is_splat = constant.getValue().isSplat();
   assert((memref_type.getRank() == 0 || is_splat) &&
-         "only scalar ConstOp can be fused");
+         "only scalar ConstantOp can be fused");
   auto loc = user->getLoc();
   rewriter.setInsertionPoint(load_op);
   auto elem_ty = memref_type.getElementType();
   bool need_cast = elem_ty.isUnsignedInteger() || elem_ty.isSignedInteger();
   Value inlined_result = nullptr;
   if (need_cast) {
-    int64_t val = is_splat
-                      ? constant.value().getSplatValue<APInt>().getSExtValue()
-                      : constant.value().getValues<APInt>()[{}].getSExtValue();
+    int64_t val =
+        is_splat ? constant.getValue().getSplatValue<APInt>().getSExtValue()
+                 : constant.getValue().getValues<APInt>()[{}].getSExtValue();
     Value const_val = rewriter.create<arith::ConstantOp>(
         loc,
         rewriter.getIntegerAttr(
@@ -107,9 +108,10 @@ bool miscFuseHelper<ConstOp>(PatternRewriter& rewriter, Operation* user,
             .getResults()
             .front();
   } else {
-    auto attr = is_splat ? constant.value().getSplatValue<Attribute>()
-                         : constant.value().getValues<Attribute>()[{}];
-    inlined_result = rewriter.create<arith::ConstantOp>(loc, elem_ty, attr);
+    auto attr = is_splat ? constant.getValue().getSplatValue<Attribute>()
+                         : constant.getValue().getValues<Attribute>()[{}];
+    inlined_result =
+        rewriter.create<arith::ConstantOp>(loc, elem_ty, cast<TypedAttr>(attr));
   }
   for (memref::LoadOp to_be_replaced : load_ops)
     to_be_replaced.replaceAllUsesWith(inlined_result);
@@ -152,7 +154,7 @@ LogicalResult InputInlineFusionPattern::processParallelOp(
     //    C should fuse B first before fusing A.
     //    This is the same logic as in instruction_fusion pass of XLA
     //
-    // 2, When multiple loads consumes the same result of lhlo_op and
+    // 2, When multiple loads consume the same result of lhlo_op and
     //    the load indices are also identical, the ir should be
     //    emitted only once. Other LoadOps should use cached Value.
 
@@ -175,7 +177,7 @@ LogicalResult InputInlineFusionPattern::processParallelOp(
     // Clean all the ops that do not have LoadOps inside the nested
     // ParallelOps and is not the ancestor of any ops that have LoadOps
     // inside the nested ParallelOps.
-    cleanUnusedLhloOps(parent_block);
+    cleanUnusedLhloOps(parent_block, &rewriter);
     return success();
   }
   return failure();
@@ -242,7 +244,7 @@ LogicalResult InputInlineFusionPattern::inlineFuseLhloOp(
     LowerConfig* lower_config) const {
   if (elemwiseFuseHelperOr<
 #define GET_SUPPORTED_OP_LIST
-#include "tensorflow/compiler/mlir/disc/transforms/disc_supported_list.h.inc"
+#include "mlir/disc/transforms/disc_supported_list.h.inc"
           >(b, user, producer, load_op, load_ops, lower_config) ||
       // TODO(disc): Upstream is on the way for more Ops
       miscFuseHelper<BroadcastInDimOp>(b, user, producer, load_op, load_ops,
@@ -253,14 +255,16 @@ LogicalResult InputInlineFusionPattern::inlineFuseLhloOp(
                               lower_config) ||
       miscFuseHelper<ConcatenateOp>(b, user, producer, load_op, load_ops,
                                     lower_config) ||
-      miscFuseHelper<ConstOp>(b, user, producer, load_op, load_ops,
-                              lower_config) ||
+      miscFuseHelper<ConstantOp>(b, user, producer, load_op, load_ops,
+                                 lower_config) ||
       miscFuseHelper<CopyOp>(b, user, producer, load_op, load_ops,
                              lower_config) ||
       miscFuseHelper<DynamicBroadcastInDimOp>(b, user, producer, load_op,
                                               load_ops, lower_config) ||
       miscFuseHelper<DynamicGatherOp>(b, user, producer, load_op, load_ops,
                                       lower_config) ||
+      miscFuseHelper<lmhlo_disc::H2DOp>(b, user, producer, load_op, load_ops,
+                                        lower_config) ||
       miscFuseHelper<DynamicIotaOp>(b, user, producer, load_op, load_ops,
                                     lower_config) ||
       miscFuseHelper<DynamicPadOp>(b, user, producer, load_op, load_ops,
@@ -285,8 +289,8 @@ LogicalResult InputInlineFusionPattern::inlineFuseLhloOp(
                                 lower_config) ||
       miscFuseHelper<SliceOp>(b, user, producer, load_op, load_ops,
                               lower_config) ||
-      // miscFuseHelper<DynamicUpdateSliceOp>(b, user, producer, load_op,
-      // load_ops, lower_config) ||
+      miscFuseHelper<DynamicUpdateSliceOp>(b, user, producer, load_op, load_ops,
+                                           lower_config) ||
       miscFuseHelper<TransposeOp>(b, user, producer, load_op, load_ops,
                                   lower_config)) {
     return success();

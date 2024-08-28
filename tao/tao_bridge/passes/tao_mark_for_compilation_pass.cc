@@ -1301,7 +1301,7 @@ Status MarkForCompilationPassImpl::FindCompilationCandidates() {
     if (!all_ops.count(string(s))) {
       return errors::InvalidArgument(
           "The operation '", s,
-          "' passed to --tf_xla_ops_to_cluster is not supported by XLA.");
+          "' passed to --tf_xla_ops_to_cluster is not supported by DISC.");
     }
   }
 
@@ -1503,30 +1503,33 @@ Status MarkForCompilationPassImpl::FindCompilationCandidates() {
           continue;
         }
       }
+    }
 
-      bool to_continue = false;
-      for (auto s : absl::StrSplit(
-               GetTaoBridgeOptions()->op_type_clustering_black_list, ',')) {
-        if (s == node->type_string()) {
-          VLOG(2) << "Rejecting " << node->type_string()
-                  << " as op type black list";
-          to_continue = true;
-          break;
-        }
+    bool to_continue = false;
+    for (auto s :
+         absl::StrSplit(GetTaoBridgeOptions()->op_type_clustering_black_list,
+                        ',', absl::SkipEmpty())) {
+      if (s == node->type_string()) {
+        VLOG(2) << "Rejecting " << node->type_string()
+                << " as op type black list";
+        to_continue = true;
+        break;
       }
+    }
 
-      for (auto s : absl::StrSplit(
-               GetTaoBridgeOptions()->op_name_clustering_black_list, ',')) {
-        if (s != "" && node->name().find(s.data()) != std::string::npos) {
-          VLOG(2) << "Rejecting " << node->name() << " as op name black list";
-          to_continue |= true;
-          break;
-        }
+    for (auto s :
+         absl::StrSplit(GetTaoBridgeOptions()->op_name_clustering_black_list,
+                        ',', absl::SkipEmpty())) {
+      // if (s != "" && node->name().find(s.data()) != std::string::npos) {
+      if (absl::StrContains(node->name(), s)) {
+        VLOG(2) << "Rejecting " << node->name() << " as op name black list";
+        to_continue |= true;
+        break;
       }
+    }
 
-      if (to_continue) {
-        continue;
-      }
+    if (to_continue) {
+      continue;
     }
 
     // This is used to fix some corner cases of our clustering strategy.
@@ -2556,6 +2559,153 @@ std::unordered_set<string>* GetFusedOpTable() {
   return result;
 }
 
+std::vector<string> GetDiscSupportedOps() {
+  std::vector<string> ops;
+  // clang-format off
+  ops.insert(ops.end(), {
+    "Abs",
+    "Add",
+    "AddN",
+    "All",
+    "Any",
+    "BatchMatMul",
+    "BiasAdd",
+    "BiasAddGrad",
+    "BroadcastTo",
+    "Cast",
+    "Ceil",
+    "ConcatV2",
+    "Const",
+    "Conv2D",
+    "Cos",
+    "DepthwiseConv2dNative",
+    "DiscFakeQuant",
+    "DynamicStitch",
+    "Equal",
+    "Erf",
+    "Exp",
+    "ExpandDims",
+    "Fill",
+    "Floor",
+    "FloorDiv",
+    "FloorMod",
+    "GatherNd",
+    "Greater",
+    "GreaterEqual",
+    "Identity",
+    "If",
+    "IsFinite",
+    "LeakyRelu",
+    "Less",
+    "LessEqual",
+    "Log",
+    "LogSoftmax",
+    "LogicalAnd",
+    "LogicalNot",
+    "LogicalOr",
+    "MatMul",
+    "Max",
+    "Maximum",
+    "Mean",
+    "Min",
+    "Minimum",
+    "Mul",
+    "Neg",
+    "NoOp",
+    "NotEqual",
+    "Pack",
+    "Pad",
+    "Pow",
+    "Prod",
+    "Range",
+    "RealDiv",
+    "Reciprocal",
+    "Relu",
+    "Relu6",
+    "ReluGrad",
+    "Reshape",
+    "Round",
+    "Rsqrt",
+    "RsqrtGrad",
+    "Select",
+    "Shape",
+    "Sigmoid",
+    "SigmoidGrad",
+    "Sign",
+    "Sin",
+    "Size",
+    "Slice",
+    "Snapshot",
+    "Softmax",
+    "SoftmaxCrossEntropyWithLogits",
+    "Softplus",
+    "Split",
+    "Sqrt",
+    "Square",
+    "SquaredDifference",
+    "Squeeze",
+    "StopGradient",
+    "StridedSlice",
+    "Sub",
+    "Sum",
+    "Tanh",
+    "TanhGrad",
+    "Tile",
+    "TopKV2",
+    "Transpose",
+    "Unpack",
+    "While",
+    "ZerosLike"
+  });
+
+#ifndef TF_1_12
+  ops.insert(ops.end(), {
+    "AddV2",
+    "BatchMatMulV2",
+    "GatherV2"
+  });
+#endif
+
+#if TF_MAJOR_VERSION > 1 || TF_MAJOR_VERSION==1 && TF_MINOR_VERSION > 12
+  ops.insert(ops.end(), {
+    "SelectV2",
+  });
+#endif
+
+#if defined(TAO_CPU_ONLY)
+#if TF_MAJOR_VERSION > 2 || TF_MAJOR_VERSION==2 && TF_MINOR_VERSION >= 4
+  ops.insert(ops.end(), {
+    "Dequantize",
+    "QuantizeV2"
+  });
+  if (GetTaoBridgeOptions()->experimental_enable_cpu_sparse_ops_compilation) {
+    ops.insert(ops.end(), {
+      "SparseReshape",
+      "SparseFillEmptyRows",
+      "SparseSegmentMean",
+      "SparseSegmentSum",
+      "Where",
+    });
+  }
+#if defined(TAO_AARCH64)
+  // TODO(disc): support `QuantizedConv2DWithBiasAndRequantize` on other platforms
+  ops.insert(ops.end(), {
+    "QuantizedConv2DWithBiasAndRequantize"
+  });
+#endif
+#endif
+#endif
+
+#if !defined(TAO_CPU_ONLY)
+  ops.insert(ops.end(), {
+    "RandomUniform"
+  });
+#endif
+
+  // clang-format on
+  return ops;
+}
+
 std::unordered_map<string, std::vector<string>>* GetWhitelistTable() {
   // Table format: category name: {list of TF operations in that category}
   // clang-format off
@@ -2602,94 +2752,7 @@ std::unordered_map<string, std::vector<string>>* GetWhitelistTable() {
             "_FusedBatchNormEx", "FusedBatchNormGrad", "FusedBatchNormGradV2",
             "FusedBatchNormGradV3"}},
           {"SORT", {"TopKV2"}},  // XLA version much faster then TF version.
-          {"MLIR",
-            (
-              GetTaoBridgeOptions()
-                ->experimental_enable_mlir_whole_graph_compilation ?
-                    std::vector<string>({
-#ifndef TF_1_12
-                      "MatMul", "BatchMatMul", "BatchMatMulV2", "Conv2D",
-                      "Abs", "AddV2", "LessEqual", "Maximum", "Minimum","Sign",
-                      "Const", "Cast", "Identity", "ConcatV2",
-                      "Transpose", "Reshape", "Range", "RealDiv", "Ceil",
-                      "Shape", "GatherV2", "Prod", "Pack", "BiasAdd", "Mean",
-                      "StopGradient", "SquaredDifference", "Add", "Rsqrt",
-                      "Mul", "Sub", "ExpandDims", "Tile", "StridedSlice",
-                      "Less", "Sum", "Fill", "Pow", "Squeeze",
-                      "TopKV2", "GatherNd", "While", "Any", "Select", "Equal",
-                      "FloorDiv", "If", "Softmax", "Relu", "Sigmoid", "Max",
-                      "IsFinite", "ZerosLike", "Exp", "Log", "FloorMod", "Floor", "Min",
-                      "Greater", "All", "LogicalNot", "LogicalAnd","LogicalOr", "Unpack",
-                      "AddN", "Tanh", "GreaterEqual", "Neg", "NotEqual",
-                      "Slice", "TanhGrad", "BiasAddGrad", "NoOp", "RsqrtGrad", "Round",
-                      "Split", /*"SplitV",*/ "SoftmaxCrossEntropyWithLogits", "Snapshot",
-                      "SigmoidGrad", "BroadcastTo", "RandomUniform", "ReluGrad", "Square",
-                      "Pad", "DynamicStitch", "LeakyRelu", "Erf", "Sqrt", "Softplus", "Relu6"
-#else
-                      "MatMul", "BatchMatMul", "Conv2D",
-                      "Abs", "LessEqual", "Maximum", "Minimum","Sign",
-                      "Const", "Cast", "Identity", "ConcatV2",
-                      "Transpose", "Reshape", "Range", "RealDiv", "Ceil",
-                      "Shape", /*"GatherV2",*/ "Prod", "Pack", "BiasAdd", "Mean",
-                      "StopGradient", "SquaredDifference", "Add", "Rsqrt",
-                      "Mul", "Sub", "ExpandDims", "Tile", "StridedSlice",
-                      "Less", "Sum", "Fill", "Pow", "Squeeze",
-                      "TopKV2", "GatherNd", "While", "Any", "Select", "Equal",
-                      "FloorDiv", "If", "Softmax", "Relu", "Sigmoid", "Max",
-                      "IsFinite", "ZerosLike", "Exp", "Log", "FloorMod", "Floor", "Min",
-                      "Greater", "All", "LogicalNot", "LogicalAnd", "LogicalOr", "Unpack",
-                      "AddN", "Tanh", "GreaterEqual", "Neg", "NotEqual",
-                      "Slice", "TanhGrad", "BiasAddGrad", "NoOp", "RsqrtGrad", "Round",
-                      "Split", /*"SplitV",*/ "SoftmaxCrossEntropyWithLogits", "Snapshot",
-                      "SigmoidGrad", "BroadcastTo", "LogSoftmax", "Reciprocal",
-                      "RandomUniform", "ReluGrad", "Square", "Pad", "DynamicStitch", "LeakyRelu",
-                      "Erf", "Sqrt", "Softplus", "Relu6"
-#endif
-                    })
-                :
-                    std::vector<string>({
-#ifndef TF_1_12
-                      "MatMul", "BatchMatMul", "BatchMatMulV2", "Conv2D",
-                      "Abs", "AddV2", "LessEqual", "Maximum", "Minimum","Sign",
-                      "Const", "Cast", "Identity", "ConcatV2",
-                      "Transpose", "Reshape", "Range", "RealDiv", "Ceil",
-                      "Shape", "GatherV2", "Prod", "Pack", "BiasAdd", "Mean",
-                      "StopGradient", "SquaredDifference", "Add", "Rsqrt",
-                      "Mul", "Sub", "ExpandDims", "Tile", "StridedSlice",
-                      "Less", "Sum", "Fill", "Pow", "Squeeze",
-                      "TopKV2", "GatherNd", "While", "Any", "Select", "Equal",
-                      "FloorDiv", "If", "Softmax", "Relu", "Sigmoid", "Max",
-                      "IsFinite", "ZerosLike", "Exp", "Log", "FloorMod", "Floor", "Min",
-                      "Greater", "All", "LogicalNot", "LogicalAnd", "LogicalOr", "Unpack",
-                      "AddN", "Tanh", "GreaterEqual", "Neg", "NotEqual",
-                      "Slice", "TanhGrad", "BiasAddGrad", "NoOp", "RsqrtGrad", "Round",
-                      "Split", /*"SplitV",*/ "SoftmaxCrossEntropyWithLogits", "Snapshot",
-                      "SigmoidGrad", "BroadcastTo", "Size", "RandomUniform", "Square",
-                      "Pad", "DynamicStitch", "LeakyRelu", "Erf", "Sqrt", "Softplus",
-                      "Relu6"
-#else
-                      "MatMul", "BatchMatMul", "Conv2D",
-                      "Abs", "LessEqual", "Maximum", "Minimum","Sign",
-                      "MatMul", "Const", "Cast", "Identity", "ConcatV2",
-                      "Transpose", "Reshape", "Range", "RealDiv", "Ceil",
-                      "Shape", "GatherV2", "Prod", "Pack", "BiasAdd", "Mean",
-                      "StopGradient", "SquaredDifference", "Add", "Rsqrt",
-                      "Mul", "Sub", "ExpandDims", "Tile", "StridedSlice",
-                      "Less", "Sum", "Fill", "BatchMatMul", "Pow", "Squeeze",
-                      "TopKV2", "GatherNd", "While", "Any", "Select", "Equal",
-                      "FloorDiv", "If", "Softmax", "Relu", "Sigmoid", "Max",
-                      "IsFinite", "ZerosLike", "Exp", "Log", "FloorMod", "Floor", "Min",
-                      "Greater", "All", "LogicalNot", "LogicalAnd", "LogicalOr", "Unpack",
-                      "AddN", "Tanh", "GreaterEqual", "Neg", "NotEqual",
-                      "Slice", "TanhGrad", "BiasAddGrad", "NoOp", "RsqrtGrad", "Round",
-                      "Split", /*"SplitV",*/ "SoftmaxCrossEntropyWithLogits", "Snapshot",
-                      "SigmoidGrad", "BroadcastTo", "LogSoftmax", "Reciprocal", "Size",
-                      "Conv2D", "RandomUniform", "Square", "Pad", "DynamicStitch", "LeakyRelu",
-                      "Erf", "Sqrt", "Softplus", "Relu6"
-#endif
-                    })
-            )
-          },
+          {"MLIR", GetDiscSupportedOps()},
           {"MISC",
                 {"BroadcastTo", "ExpandDims", "Fill", "NoOp",
        "Range", "Rank", "Reshape", "Shape", "ShapeN", "Size", "Squeeze",

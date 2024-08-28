@@ -10,19 +10,51 @@
 // limitations under the License.
 
 #include <string>
+#include <unordered_map>
 #include <vector>
+
+#include "mlir/disc/tests/mlir_test.h"
 
 namespace mlir_test {
 
 enum class BackendType;
 
-bool feature_test_main(const std::string& mlir_file_path,
-                       const std::vector<BackendType>& backend_types,
-                       int num_inputs, int num_outputs,
-                       const std::vector<std::string>& input_descriptors,
-                       const std::vector<std::string>& output_descriptors,
-                       const std::vector<std::vector<float>>& input_vals = {},
-                       bool profiling = false, bool multi_cc_mode = false,
-                       bool multi_cc_mode_dbg_ptx_only = false);
+// key -> (value, pre-exist?)
+using EnvSetting =
+    std::unordered_map<std::string, std::pair<std::string, bool>>;
+using EnvSettings = std::vector<EnvSetting>;
+
+struct EnvSettingContext {
+  explicit EnvSettingContext(const EnvSetting& setting) : setting(setting) {
+    VLOG(0) << "Apply env setting:";
+    for (const auto& kv : setting) {
+      VLOG(0) << "\t" << kv.first << " = " << kv.second.first;
+      setenv(kv.first.c_str(), kv.second.first.c_str(), 1);
+    }
+  }
+
+  ~EnvSettingContext() {
+    VLOG(0) << "Unset env setting:";
+    for (const auto& kv : setting) {
+      // not a pre-exist flag, unset it.
+      if (!kv.second.second) {
+        VLOG(0) << "\t" << kv.first << " = " << kv.second.first;
+        unsetenv(kv.first.c_str());
+      }
+    }
+  }
+
+  EnvSetting setting;
+};
+
+bool feature_test_main(
+    const std::string& mlir_file_path,
+    const std::vector<BackendType>& backend_types, int num_inputs,
+    int num_outputs, const std::vector<std::string>& input_descriptors,
+    const std::vector<std::string>& output_descriptors,
+    const std::vector<std::vector<float>>& input_vals = {},
+    const std::vector<tensorflow::Tensor>& expected_output_vals = {},
+    bool profiling = false, bool multi_cc_mode = false,
+    bool multi_cc_mode_dbg_ptx_only = false);
 
 }  // namespace mlir_test

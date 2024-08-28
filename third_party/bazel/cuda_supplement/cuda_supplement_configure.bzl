@@ -9,7 +9,6 @@ def _create_dummy_repository(repo_ctx):
         "%{IF_HAS_CUDNN_STATIC}": "False",
     })
 
-
 def _impl(repo_ctx):
     cuda_path = repo_ctx.os.environ.get(_TF_CUDA_HOME, None)
     if cuda_path != None:

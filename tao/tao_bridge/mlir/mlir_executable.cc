@@ -19,7 +19,7 @@
 #include "tao_bridge/kernels/disc_launch.h"
 #endif  // PLATFORM_ALIBABA
 
-#include "tensorflow/compiler/mlir/xla/ral/ral_api.h"
+#include "mlir/ral/ral_api.h"
 
 namespace tensorflow {
 namespace tao {
@@ -44,6 +44,20 @@ MlirExecutable::~MlirExecutable() {
 void MlirExecutable::DumpToFile(const std::string& filename) const {
   TaoCompilerResult result(tao_compiler_result());
   *result.mutable_target_device() = target_device();
+  *result.mutable_mlir()->mutable_so_lib_filename() = filename + ".so";
+  *result.mutable_mlir()->mutable_const_proto_filename() = filename + ".so.pb";
+  if (tao_compiler_result().mlir().so_lib_filename() !=
+      result.mlir().so_lib_filename()) {
+    TF_CHECK_OK(tensorflow::Env::Default()->CopyFile(
+        tao_compiler_result().mlir().so_lib_filename(),
+        result.mlir().so_lib_filename()));
+  }
+  if (tao_compiler_result().mlir().const_proto_filename() !=
+      result.mlir().const_proto_filename()) {
+    TF_CHECK_OK(tensorflow::Env::Default()->CopyFile(
+        tao_compiler_result().mlir().const_proto_filename(),
+        result.mlir().const_proto_filename()));
+  }
   CHECK(WriteTextProto(tensorflow::Env::Default(), filename, result).ok());
 }
 

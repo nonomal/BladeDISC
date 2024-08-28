@@ -23,13 +23,10 @@ include "mlir/IR/OpBase.td"
 def RAL_Dialect : Dialect {
   let name = "disc_ral";
   let cppNamespace = "::mlir::disc_ral";
-
-  let emitAccessorPrefix = kEmitAccessorPrefix_Raw;
 }
 
 class RAL_Op<string mnemonic, list<Trait> traits> :
     Op<RAL_Dialect, mnemonic, traits> {
-  let verifier = [{ return Verify(*this); }];
 }
 
 def RAL_RalExecutionContextType : DialectType<RAL_Dialect,
@@ -89,6 +86,7 @@ def RAL_DispatchOp: RAL_Op<"dispatch", []> {
     Variadic<AnyType>:$args,
     StrAttr:$call_target_name,
     DefaultValuedAttr<BoolAttr, "false">:$has_side_effect,
+    DefaultValuedStrAttr<StrAttr, "">:$device,
     DefaultValuedStrAttr<StrAttr, "">:$backend_config
   );
   let results = (outs Variadic<AnyType>);
@@ -111,4 +109,14 @@ def RAL_CpuLaunchOp: RAL_Op<"cpu_launch", []> {
   let results = (outs);
 }
 
+def RAL_GetPointerOp: RAL_Op<"get_pointer", [SameTypeOperands]> {
+  let summary = "return buffer pointer as int8";
+  let description = [{
+    get data pointer from memref type.
+  }];
+  let arguments = (ins
+   MemRefOf<[AnyType]>:$operand 
+  );
+  let results = (outs I64:$result);
+}
 #endif // DISC_RAL_OPS

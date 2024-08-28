@@ -16,14 +16,14 @@ limitations under the License.
 #ifndef TENSORFLOW_COMPILER_MLIR_HLO_INCLUDE_MLIR_HLO_DIALECT_MHLO_TRANSFORMS_LHLO_ELEMENTAL_UTILS_H_
 #define TENSORFLOW_COMPILER_MLIR_HLO_INCLUDE_MLIR_HLO_DIALECT_MHLO_TRANSFORMS_LHLO_ELEMENTAL_UTILS_H_
 
+#include "lhlo/IR/lhlo_ops.h"
+#include "lhlo/transforms/map_lmhlo_to_scalar_op.h"
 #include "llvm/Support/Debug.h"
-#include "mlir-hlo/Dialect/lhlo/IR/lhlo_ops.h"
-#include "mlir-hlo/Dialect/lhlo/transforms/map_lmhlo_to_scalar_op.h"
-#include "mlir-hlo/Dialect/mhlo/transforms/map_mhlo_to_scalar_op.h"
-#include "mlir/Dialect/Arithmetic/IR/Arithmetic.h"
+#include "mhlo/transforms/map_mhlo_to_scalar_op.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
-#include "mlir/Dialect/StandardOps/IR/Ops.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/disc/transforms/codegen_utils.h"
 
 namespace mlir {
 
@@ -53,22 +53,71 @@ class LowerConfig {
  public:
   // SpecificLoader is for stitch codegen, which helps to hook the original load
   // with specific shm memref.
-  using SpecificLoaderFunc = std::function</*output*/ Value(
-      OpBuilder&, /*operand-memref*/ Value, /*indices*/ ValueRange,
-      /*shmem-buffer*/ Value, /*row-per-block*/ int64_t)>;
   struct SpecificLoader {
     SpecificLoader() {}
-    SpecificLoader(SpecificLoaderFunc f, Value shm, int64_t tile_size)
-        : func_(f), target_shm_(shm), row_per_block_(tile_size) {}
-    SpecificLoaderFunc func_;
-    Value target_shm_;
-    int64_t row_per_block_;
+
+    SpecificLoader(Value shm, int64_t element_per_block)
+        : shm_buffer_(shm), element_per_block_(element_per_block) {}
+
     Value operator()(OpBuilder& b, Value memref, ValueRange indices) {
-      return func_(b, memref, indices, target_shm_, row_per_block_);
+      return loadShmem(b, memref, indices);
     }
+
+    Value loadShmem(OpBuilder& b, Value value, ValueRange indices) {
+      auto loc = shm_buffer_.getLoc();
+      assert(shm_buffer_ != nullptr);
+      // It requires the elements store in shm_buffer are in index order.
+      auto shape = getShapeValues(&b, value);
+      assert(shape.size() == indices.size());
+      Value linear_index = calcLinearIndex(&b, loc, indices, shape);
+      Value element_per_block_val =
+          b.create<arith::ConstantIndexOp>(loc, element_per_block_);
+      Value shmem_index =
+          b.create<arith::RemUIOp>(loc, linear_index, element_per_block_val);
+      Value res =
+          b.create<memref::LoadOp>(loc, shm_buffer_, ValueRange({shmem_index}));
+      return res;
+    }
+
+    Value shm_buffer_;
+    int64_t element_per_block_;
+  };
+
+  // SpecificStore is for stitch codegen, which helps to hook the original store
+  // with specific shm memref.
+  struct SpecificStore {
+    SpecificStore() {}
+
+    SpecificStore(Value shm, int64_t element_per_block)
+        : shm_buffer_(shm), element_per_block_(element_per_block) {}
+
+    void operator()(OpBuilder& b, Value value, Value memref,
+                    ValueRange indices) {
+      storeShmem(b, value, memref, indices);
+    }
+
+    void storeShmem(OpBuilder& b, Value value, Value memref,
+                    ValueRange indices) {
+      auto loc = shm_buffer_.getLoc();
+      assert(shm_buffer_ != nullptr);
+      // It requires the elements store in shm_buffer are in index order.
+      auto shape = getShapeValues(&b, memref);
+      assert(shape.size() == indices.size());
+      Value linear_index = calcLinearIndex(&b, loc, indices, shape);
+      Value element_per_block_val =
+          b.create<arith::ConstantIndexOp>(loc, element_per_block_);
+      Value shmem_index =
+          b.create<arith::RemUIOp>(loc, linear_index, element_per_block_val);
+      b.create<memref::StoreOp>(loc, value, shm_buffer_,
+                                ValueRange({shmem_index}));
+    }
+
+    Value shm_buffer_;
+    int64_t element_per_block_;
   };
 
   SpecificLoader* getSpecificLoader(Operation* op, Value operand);
+  SpecificStore* getSpecificStore(Operation* op, Value operand);
 
   bool isWrittenBack(Operation* op) { return is_written_back_.contains(op); }
 
@@ -79,8 +128,14 @@ class LowerConfig {
     specific_loaders_[loader_for] = loader;
   }
 
+  void setSpecificStore(std::pair<Operation*, Value> store_for,
+                        SpecificStore store) {
+    specific_stores_[store_for] = store;
+  }
+
  private:
   DenseMap<std::pair<Operation*, Value>, SpecificLoader> specific_loaders_;
+  DenseMap<std::pair<Operation*, Value>, SpecificStore> specific_stores_;
   DenseSet<Operation*> is_written_back_;
 };
 
@@ -125,7 +180,8 @@ bool isUnsignedIntegerValue(Value val);
 
 Type convertIfIntegerType(Type type);
 
-bool needUpgradingUnsignedInteger(Operation* op);
+SmallVector<Value> convertValuesIfIntegerType(Location loc, OpBuilder* b,
+                                              ValueRange vs);
 
 struct LhloOpToStdScalarOp {
   template <typename OpTy>
@@ -135,25 +191,19 @@ struct LhloOpToStdScalarOp {
 template <typename OpTy>
 Value LhloOpToStdScalarOp::map(OpTy op, Type resultType, ValueRange operands,
                                OpBuilder* b) {
-  if (!needUpgradingUnsignedInteger(op))
-    return lmhlo::LhloOpToStdScalarOp::map<OpTy>(cast<OpTy>(op), resultType,
-                                                 operands, b);
   Location loc = op->getLoc();
-  SmallVector<Value> newOperands;
-  for (Value operand : operands) {
-    Type oldType = operand.getType();
-    Type newType = convertIfIntegerType(oldType);
-    Value newOperand = operand;
-    if (oldType != newType)
-      newOperand = b->create<UnrealizedConversionCastOp>(loc, newType, operand)
-                       ->getResult(0);
-    newOperands.push_back(newOperand);
-  }
+  auto newOperands = convertValuesIfIntegerType(loc, b, operands);
   Type newResultType = convertIfIntegerType(resultType);
-  Value result = lmhlo::LhloOpToStdScalarOp::map<OpTy>(
-      cast<OpTy>(op), resultType, newOperands, b);
+  Value result;
+  if (std::is_same<OpTy, lmhlo::ConvertOp>::value) {
+    result = mhlo::impl::mapConvertOpToStdScalarOp(
+        loc, resultType, newResultType,
+        llvm::to_vector<>(op->getOperandTypes()), newOperands, b);
+  } else {
+    result = lmhlo::LhloOpToStdScalarOp::map<OpTy>(
+        cast<OpTy>(op), newResultType, newOperands, b);
+  }
   if (newResultType != resultType) {
-    result.setType(newResultType);
     result = b->create<UnrealizedConversionCastOp>(loc, resultType, result)
                  ->getResult(0);
   }

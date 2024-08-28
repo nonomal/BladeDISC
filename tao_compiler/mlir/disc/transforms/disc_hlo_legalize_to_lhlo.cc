@@ -19,34 +19,36 @@ limitations under the License.
 #include <algorithm>
 #include <utility>
 
-#include "mlir/Dialect/Arithmetic/IR/Arithmetic.h"
+#include "lhlo/IR/lhlo_ops.h"
+#include "llvm/Support/Debug.h"
+#include "mhlo/IR/hlo_ops.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Bufferization/Transforms/Bufferize.h"
+#include "mlir/Dialect/Func/Transforms/FuncConversions.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Shape/IR/Shape.h"
 #include "mlir/Dialect/Shape/Transforms/Passes.h"
-#include "mlir/Dialect/StandardOps/IR/Ops.h"
-#include "mlir/Dialect/StandardOps/Transforms/FuncConversions.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/AffineMap.h"
 #include "mlir/IR/Attributes.h"
-#include "mlir/IR/BlockAndValueMapping.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Location.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
-#include "tensorflow/compiler/mlir/disc/IR/disc_shape_ops.h"
-#include "tensorflow/compiler/mlir/disc/IR/hlo_disc_ops.h"
-#include "tensorflow/compiler/mlir/disc/IR/lhlo_disc_ops.h"
-#include "tensorflow/compiler/mlir/disc/transforms/PassDetail.h"
-#include "tensorflow/compiler/mlir/disc/transforms/codegen_utils.h"
-#include "tensorflow/compiler/mlir/disc/transforms/disc_map_hlo_to_lhlo_op.h"
-#include "tensorflow/compiler/mlir/disc/transforms/rewriters.h"
+#include "mlir/disc/IR/disc_shape_ops.h"
+#include "mlir/disc/IR/hlo_disc_ops.h"
+#include "mlir/disc/IR/lhlo_disc_ops.h"
+#include "mlir/disc/transforms/PassDetail.h"
+#include "mlir/disc/transforms/codegen_utils.h"
+#include "mlir/disc/transforms/disc_map_hlo_to_lhlo_op.h"
+#include "mlir/disc/transforms/rewriters.h"
 
 namespace mlir {
 namespace mhlo_disc {
@@ -69,8 +71,8 @@ Value InsertDynamicAlloc(Location loc, Value result, Value shape_operand,
 
   // Extract the required element out of the vector.
   SmallVector<Value, 4> dynamic_operands;
-  for (auto shape_element : llvm::enumerate(result_type.getShape())) {
-    if (shape_element.value() != ShapedType::kDynamicSize) continue;
+  for (const auto& shape_element : llvm::enumerate(result_type.getShape())) {
+    if (shape_element.value() != ShapedType::kDynamic) continue;
     Value index =
         rewriter->create<arith::ConstantIndexOp>(loc, shape_element.index());
     Value alloc_operand =
@@ -105,7 +107,7 @@ LogicalResult ConvertResults(Operation* op, SmallVectorImpl<Value>& results,
                              ConversionPatternRewriter& rewriter) {
   size_t num_operands = results.size();
   SmallVector<Value, 2> tensor_operands;
-  for (auto result : llvm::enumerate(op->getResults())) {
+  for (const auto& result : llvm::enumerate(op->getResults())) {
     RankedTensorType resultType =
         result.value().getType().dyn_cast<RankedTensorType>();
     if (!resultType) return failure();
@@ -152,19 +154,61 @@ class HloToLhloOpConverter : public BaseOpConversion<HloOpTy> {
     SmallVector<Value, 4> buffer_args(operands.begin(), operands.end());
     if (failed(ConvertResults(op, buffer_args, rewriter))) return failure();
     rewriter.create<mhlo_disc::HloToLhloOp<HloOpTy>>(
-        op->getLoc(), llvm::None, buffer_args, op->getAttrs());
+        op->getLoc(), TypeRange{}, buffer_args, op->getAttrs());
     rewriter.replaceOp(
         op, llvm::makeArrayRef(buffer_args).drop_front(operands.size()));
     return success();
   }
 };
 
-struct HloToLhloCustomCallOpConverter : public BaseOpConversion<CustomCallOp> {
+struct HloToLhloArgsMutationOpConverter
+    : public BaseOpConversion<ArgsMutationOp> {
  public:
-  using BaseOpConversion<CustomCallOp>::BaseOpConversion;
+  using BaseOpConversion<ArgsMutationOp>::BaseOpConversion;
+  LogicalResult matchAndRewrite(
+      ArgsMutationOp hloOp, OpAdaptor adaptor,
+      ConversionPatternRewriter& rewriter) const override {
+    Operation* op = hloOp.getOperation();
+    auto operands = adaptor.getOperands();
+    SmallVector<Value, 4> buffer_args(operands.begin(), operands.end());
+    auto lhloOp = rewriter.create<lmhlo_disc::ArgsMutationOp>(
+        op->getLoc(), TypeRange{}, buffer_args);
+    rewriter.replaceOp(op, ArrayRef<Value>(buffer_args));
+    return success();
+  }
+};
+
+struct HloToLhloOptimizationBarrierOpConverter
+    : public BaseOpConversion<mhlo::OptimizationBarrierOp> {
+ public:
+  using BaseOpConversion<mhlo::OptimizationBarrierOp>::BaseOpConversion;
+  LogicalResult matchAndRewrite(
+      mhlo::OptimizationBarrierOp hloOp, OpAdaptor adaptor,
+      ConversionPatternRewriter& rewriter) const override {
+    Operation* op = hloOp.getOperation();
+    auto operands = adaptor.getOperands();
+
+    SmallVector<Type> resultTypes;
+    for (Value v : hloOp.getResults()) {
+      auto ty = v.getType().cast<RankedTensorType>();
+      resultTypes.push_back(
+          MemRefType::get(ty.getShape(), ty.getElementType()));
+    }
+
+    rewriter.replaceOpWithNewOp<lmhlo_disc::OptimizationBarrierOp>(
+        hloOp, resultTypes, operands, op->getAttrs());
+
+    return success();
+  }
+};
+
+struct HloToLhloCustomCallOpConverter
+    : public BaseOpConversion<mhlo_disc::CustomCallOp> {
+ public:
+  using BaseOpConversion<mhlo_disc::CustomCallOp>::BaseOpConversion;
 
   LogicalResult matchAndRewrite(
-      CustomCallOp hloOp, OpAdaptor adaptor,
+      mhlo_disc::CustomCallOp hloOp, OpAdaptor adaptor,
       ConversionPatternRewriter& rewriter) const override {
     Operation* op = hloOp.getOperation();
     auto operands = adaptor.getOperands();
@@ -172,15 +216,139 @@ struct HloToLhloCustomCallOpConverter : public BaseOpConversion<CustomCallOp> {
     if (failed(ConvertResults(op, buffer_args, rewriter))) return failure();
 
     auto lhloOp = rewriter.create<lmhlo_disc::CustomCallOp>(
-        op->getLoc(), llvm::None, buffer_args, op->getAttrs());
+        op->getLoc(), TypeRange{}, buffer_args, op->getAttrs());
     // Setup AttrSizedOperandSegments attribute to indicate number of operands
     // for args and outputs.
     const int32_t segments[2] = {static_cast<int32_t>(operands.size()),
                                  static_cast<int32_t>(op->getNumResults())};
-    lhloOp->setAttr(lhloOp.getOperandSegmentSizeAttr(),
-                    rewriter.getI32VectorAttr(segments));
+    auto attrValue = mlir::DenseI32ArrayAttr::get(op->getContext(), segments);
+    lhloOp->setAttr(lhloOp.getOperandSegmentSizeAttr(), attrValue);
 
     rewriter.replaceOp(op, ArrayRef<Value>(buffer_args).slice(operands.size()));
+    return success();
+  }
+};
+
+struct HloToLhloCustomCallOpV2Converter
+    : public BaseOpConversion<mhlo_disc::CustomCallV2Op> {
+ public:
+  using BaseOpConversion<mhlo_disc::CustomCallV2Op>::BaseOpConversion;
+
+  LogicalResult matchAndRewrite(
+      mhlo_disc::CustomCallV2Op hloOp, OpAdaptor adaptor,
+      ConversionPatternRewriter& rewriter) const override {
+    Location loc = hloOp->getLoc();
+    SmallVector<Type> resultTypes;
+    for (Value v : hloOp->getResults()) {
+      auto ty = v.getType().cast<RankedTensorType>();
+      resultTypes.push_back(
+          MemRefType::get(ty.getShape(), ty.getElementType()));
+    }
+
+    rewriter.replaceOpWithNewOp<lmhlo_disc::CustomCallV2Op>(
+        hloOp, resultTypes, adaptor.getOperands(), hloOp->getAttrs());
+
+    return success();
+  }
+};
+
+struct CustomCallOpConverter : public BaseOpConversion<mhlo::CustomCallOp> {
+ public:
+  using BaseOpConversion<mhlo::CustomCallOp>::BaseOpConversion;
+
+  LogicalResult matchAndRewrite(
+      mhlo::CustomCallOp hloOp, OpAdaptor adaptor,
+      ConversionPatternRewriter& rewriter) const override {
+    Operation* op = hloOp.getOperation();
+    auto operands = adaptor.getOperands();
+
+    SmallVector<Type> resultTypes;
+
+    std::string input_placements, output_placements;
+    std::string input_layouts, output_layouts;
+    for (int i = 0; i < operands.size(); i++) {
+      input_placements += "d,";
+      input_layouts += "*,";
+    }
+
+    hloOp->setAttr("call_target_name",
+                   rewriter.getStringAttr(hloOp.getCallTargetName()));
+    hloOp->setAttr("device", rewriter.getStringAttr("x"));
+
+    SmallVector<NamedAttribute> newAttrs;
+    if (hloOp.getBackendConfig().has_value()) {
+      newAttrs.push_back(
+          NamedAttribute(rewriter.getStringAttr("backend_config"),
+                         hloOp.getBackendConfig().value()));
+    }
+    auto newCustomAttrs = DictionaryAttr::get(hloOp->getContext(), newAttrs);
+    hloOp->setAttr("custom_attrs", newCustomAttrs);
+
+    if (hloOp->getNumResults() == 1 &&
+        hloOp->getResult(0).getType().dyn_cast<mlir::TupleType>()) {
+      auto tupleTy = hloOp->getResult(0).getType().dyn_cast<mlir::TupleType>();
+      for (auto [index, ty] : llvm::enumerate(tupleTy.getTypes())) {
+        output_placements += "d,";
+        output_layouts += "*,";
+        auto tensor_type = ty.cast<RankedTensorType>();
+        if (!tensor_type) {
+          op->emitOpError() << "Unsupported result type in disc for ";
+        }
+        resultTypes.push_back(tensor_type);
+      }
+    } else {
+      output_placements = "d,";
+      output_layouts += "*,";
+      for (Value v : hloOp->getResults()) {
+        auto ty = v.getType().cast<RankedTensorType>();
+        if (!ty) {
+          op->emitOpError() << "Unsupported result type in disc for ";
+        }
+        resultTypes.push_back(ty);
+      }
+    }
+
+    if (!input_placements.empty()) {
+      input_placements.pop_back();
+      input_layouts.pop_back();
+    }
+    if (!output_placements.empty()) {
+      output_placements.pop_back();
+      output_layouts.pop_back();
+    }
+
+    hloOp->setAttr("input_placements",
+                   rewriter.getStringAttr(input_placements));
+    hloOp->setAttr("output_placements",
+                   rewriter.getStringAttr(output_placements));
+    hloOp->setAttr("input_layouts", rewriter.getStringAttr(input_layouts));
+    hloOp->setAttr("output_layouts", rewriter.getStringAttr(output_layouts));
+    hloOp->setAttr("expected_input_layouts",
+                   rewriter.getStringAttr(input_layouts));
+    hloOp->setAttr("expected_output_layouts",
+                   rewriter.getStringAttr(output_layouts));
+
+    auto custom_v2_op = rewriter.create<mhlo_disc::CustomCallV2Op>(
+        hloOp.getLoc(), resultTypes, operands, hloOp->getAttrs());
+
+    if (hloOp->getNumResults() == 1 &&
+        hloOp->getResult(0).getType().dyn_cast<mlir::TupleType>()) {
+      auto tupleValue = hloOp->getResult(0);
+      for (int index = 0; index < resultTypes.size(); index++) {
+        for (auto& use : tupleValue.getUses()) {
+          Operation* consumerOp = use.getOwner();
+          if (auto getTupleElementOp =
+                  llvm::dyn_cast<mhlo::GetTupleElementOp>(consumerOp)) {
+            if (getTupleElementOp.getIndex() == index) {
+              rewriter.replaceOp(consumerOp, {custom_v2_op.getResult(index)});
+              break;
+            }
+          }
+        }
+      }
+    }
+
+    rewriter.replaceOp(hloOp, custom_v2_op.getResults());
     return success();
   }
 };
@@ -198,10 +366,13 @@ struct TieShapeOpConverter : public BaseOpConversion<TieShapeOp> {
     int64_t rank = operands.size() - 1;
     auto memrefTy = memref.getType().cast<MemRefType>();
     assert(memrefTy.getRank() == rank);
-    assert(memrefTy.getAffineMaps().empty());
 
     Value castedValue = disc_ral::CastMemRefTo(rewriter, loc, memref, memrefTy,
                                                operands.drop_front());
+    StringRef attrName = disc_shape::SymbolicDimOp::getSymbolicDimAttrName();
+    if (op->hasAttr(attrName)) {
+      castedValue.getDefiningOp()->setAttr(attrName, op->getAttr(attrName));
+    }
     rewriter.replaceOp(op, {castedValue});
     return success();
   }
@@ -214,7 +385,9 @@ struct DiscHloLegalizeToLhlo
 
   void getDependentDialects(DialectRegistry& registry) const override {
     registry.insert<lmhlo_disc::LmhloDiscDialect, memref::MemRefDialect,
-                    shape::ShapeDialect>();
+                    shape::ShapeDialect, bufferization::BufferizationDialect,
+                    lmhlo::LmhloDialect, mhlo::MhloDialect,
+                    mhlo_disc::MhloDiscDialect>();
   }
 
  public:
@@ -224,12 +397,16 @@ struct DiscHloLegalizeToLhlo
     auto& context = getContext();
     RewritePatternSet patterns(&context);
     ConversionTarget target(context);
-    target.addLegalDialect<
-        arith::ArithmeticDialect, lmhlo_disc::LmhloDiscDialect,
-        bufferization::BufferizationDialect, StandardOpsDialect,
-        memref::MemRefDialect, shape::ShapeDialect, tensor::TensorDialect>();
+    target.addLegalDialect<arith::ArithDialect, lmhlo_disc::LmhloDiscDialect,
+                           bufferization::BufferizationDialect,
+                           memref::MemRefDialect, shape::ShapeDialect,
+                           tensor::TensorDialect, lmhlo::LmhloDialect,
+                           mhlo::MhloDialect>();
     target.addIllegalDialect<mhlo_disc::MhloDiscDialect>();
     target.addIllegalOp<disc_shape::TieShapeOp>();
+    target.addIllegalOp<mhlo_disc::ArgsMutationOp>();
+    target.addIllegalOp<mhlo::CustomCallOp>();
+    target.addIllegalOp<mhlo::OptimizationBarrierOp>();
 
     bufferization::BufferizeTypeConverter converter;
     populateDiscHLOToLHLOConversionPattern(&context, &converter, &patterns);
@@ -246,9 +423,20 @@ void populateDiscHLOToLHLOConversionPattern(
     RewritePatternSet* patterns) {
   // clang-format off
   patterns->insert<
+      CustomCallOpConverter,
       HloToLhloOpConverter<mhlo_disc::H2DOp>,
       HloToLhloOpConverter<mhlo_disc::D2HOp>,
+      HloToLhloOpConverter<mhlo_disc::QuantizedDotGeneralOp>,
+      HloToLhloOpConverter<mhlo_disc::QuantizedDynamicConvOp>,
+      HloToLhloOpConverter<mhlo_disc::SparseReshapeOp>,
+      HloToLhloOpConverter<mhlo_disc::SparseFillEmptyRowsOp>,
+      HloToLhloOpConverter<mhlo_disc::SparseSegmentReductionOp>,
+      HloToLhloOpConverter<mhlo_disc::SparseSegmentReductionWithEmptyRowsOp>,
+      HloToLhloOpConverter<mhlo_disc::WhereOp>,
+      HloToLhloArgsMutationOpConverter,
       HloToLhloCustomCallOpConverter,
+      HloToLhloCustomCallOpV2Converter,
+      HloToLhloOptimizationBarrierOpConverter,
       TieShapeOpConverter
   >(*converter, context);
   // clang-format on

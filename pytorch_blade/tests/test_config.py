@@ -11,7 +11,9 @@
 
 import unittest
 
+import torch
 from torch_blade.config import Config
+from torch_blade.pass_manager import _get_current_onnx_opset_version, _set_opset_version_from_config
 from torch_blade.testing.common_utils import TestCase
 
 
@@ -23,14 +25,20 @@ class TestConfig(TestCase):
         new_cfg.fp16_fallback_op_ratio = 0.5
         new_cfg.enable_mlir_amp = True
         new_cfg.disc_cpu_fast_math_level = 0
+        new_cfg.disc_compile_for_multi_cuda_targets = False
         with new_cfg:
             self.assertEqual(len(Config.get_contexts()), 1)
             now_cfg = Config.get_current_context_or_new()
             self.assertEqual(now_cfg.disc_cpu_fast_math_level, 0)
+            self.assertEqual(now_cfg.disc_compile_for_multi_cuda_targets, False)
         now_cfg = Config.get_current_context_or_new()
         self.assertEqual(default_cfg.fp16_fallback_op_ratio, now_cfg.fp16_fallback_op_ratio)
         self.assertEqual(default_cfg.enable_mlir_amp, now_cfg.enable_mlir_amp)
         self.assertEqual(default_cfg.disc_cpu_fast_math_level, now_cfg.disc_cpu_fast_math_level)
+        self.assertEqual(
+            default_cfg.disc_compile_for_multi_cuda_targets,
+            now_cfg.disc_compile_for_multi_cuda_targets
+        )
 
     def test_config_work(self):
         new_cfg = Config()
@@ -162,9 +170,35 @@ class TestConfig(TestCase):
             self.assertEqual(now_cfg.dynamic_tuning_shapes[1]['max'], shapes2['max'])
             self.assertEqual(now_cfg.dynamic_tuning_shapes[1]['opts'], shapes2['opts'])
 
+    def test_dynamic_tuning_inputs(self):
+        min_inp = {1: torch.tensor(1, device=self.device)}
+        max_inp = {3: torch.tensor(3, device=self.device)}
+        opt_inp = {2: torch.tensor(1, device=self.device)}
+        cfg = Config()
+        cfg.dynamic_tuning_inputs = {
+            "min": [min_inp],
+            "max": [max_inp],
+            "opts": [
+                [opt_inp]
+            ]
+        }
+        with cfg:
+            trt_dynamic_inputs = Config.get_current_context_or_new().dynamic_tuning_inputs
+            self.assertEqual(len(trt_dynamic_inputs), 1)
+            self.assertEqual(trt_dynamic_inputs[0]['min'], [min_inp])
+            self.assertEqual(trt_dynamic_inputs[0]['max'], [max_inp])
+            self.assertEqual(trt_dynamic_inputs[0]['opts'], [[opt_inp]])
 
     def test_customize_onnx_version(self):
         self._test_numeric_config('customize_onnx_opset_version', 9, -1)
+
+        # test get_current_onnx_opset_version
+        new_cfg = Config()
+        new_cfg.customize_onnx_opset_version = 10
+        with new_cfg:
+            _set_opset_version_from_config()
+            current_onnx_opset_version = _get_current_onnx_opset_version()
+            self.assertEqual(current_onnx_opset_version, 10)
 
     def test_enable_force_to_cuda(self):
         self._test_numeric_config('enable_force_to_cuda', True, -1)
@@ -174,6 +208,7 @@ class TestConfig(TestCase):
 
     def test_customize_op_white_list(self):
         self._test_list_config('customize_op_white_list', ['aten::size', 'aten::view'])
+
 
 if __name__ == "__main__":
     unittest.main()

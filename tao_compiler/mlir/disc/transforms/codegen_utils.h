@@ -22,8 +22,7 @@ limitations under the License.
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
-#include "mlir/Dialect/SCF/SCF.h"
-#include "mlir/Dialect/StandardOps/IR/Ops.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Attributes.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Location.h"
@@ -32,7 +31,12 @@ limitations under the License.
 namespace mlir {
 namespace disc_ral {
 
+#if TENSORFLOW_USE_ROCM
+constexpr int kWarpSize = 64;
+#else
 constexpr int kWarpSize = 32;
+#endif
+
 constexpr const char* kGpuBinaryAttrName = "gpu.binary";
 // In multi_cc_support node:
 //   We provide support for {V100: sm_70, T4: sm_75, A100: sm_80}
@@ -76,16 +80,26 @@ using DiscColReductionScheduleType = enum : int {
   DISC_TILE_W8_H32 = 1,
   DISC_TILE_W8_H16 = 2,
   DISC_TILE_W8_H8 = 3,
+  DISC_TILE_LOOP_W64_H8 = 4,
+  DISC_TILE_LOOP_W16_H32 = 5,
+  DISC_TILE_LOOP_W8_H8 = 6,
+  DISC_THREAD_TILE_H32 = 7,
+  DISC_BLOCK_TILE_H64 = 8,
 };
 
 // number of therads per block when doing codegen on GPU.
-constexpr const char* kThreadPerBlockHint = "disc_thread_per_block_hint";
+constexpr const char* kCTASizeHint = "disc_cta_size_hint";
 
 // empirical column size used to choose different row reduce schedule.
 constexpr const int kRowReductionScheduleTurningSize = 512;
 
 // default num of threads per block used when doing codegen
-constexpr const int kThreadsRowReduction = 256;
+#if TENSORFLOW_USE_ROCM
+constexpr const int kCTASizeDefault = 512;
+#else
+constexpr const int kCTASizeDefault = 256;
+constexpr const int kCTASize512 = 512;
+#endif
 
 constexpr const int kVectorizeOrTileSize = 2;
 
@@ -100,21 +114,11 @@ constexpr const int kReductionTileSizeOnCPU = 128;
 
 int getReductionTileSizeOnCPU();
 
-// SM number and max-threads-per-SM of different NVIDIA GPU architectures.
-// key: {arch-major, arch-minor}, value: {SM-number, max-threads-per-SM}
-const std::map<std::pair<int, int>, std::pair<int, int>> ArchToGPUThreadNumber =
-    {
-        {std::make_pair(7, 0), std::make_pair(80, 2048)},   // V100
-        {std::make_pair(7, 5), std::make_pair(40, 1024)},   // T4
-        {std::make_pair(8, 0), std::make_pair(108, 2048)},  // A100
-        // TODO: add data of A10
-};
-
 int getRowReductionScheduleHint(Operation* op);
 
 int getVectorizeOrTileHint(Operation* op);
 
-int getThreadPerBlock(Operation* op);
+int getCTASize(Operation* op);
 
 int getColReductionScheduleHint(Operation* op);
 
@@ -153,6 +157,12 @@ scf::ParallelOp createParallelAndSetInsPt(OpBuilder& b, Location loc,
 
 std::pair<scf::ParallelOp, scf::ParallelOp> tileParallelLoop(
     scf::ParallelOp op, ArrayRef<int64_t> tileSizes, bool withInboundCheck);
+
+LogicalResult loopUnrollByFactorAndTryInterleave(
+    scf::ForOp forOp, uint64_t unrollFactor,
+    function_ref<void(unsigned, Operation*, OpBuilder)> annotateFn = nullptr);
+
+void createAlignMemrefWithTile(OpBuilder& b, Value memref, int64_t tile_size);
 
 }  // namespace disc_ral
 }  // namespace mlir

@@ -15,8 +15,9 @@ limitations under the License.
 
 #include <openssl/md5.h>
 
+#include "lhlo/IR/lhlo_ops.h"
 #include "llvm/ADT/StringExtras.h"
-#include "mlir-hlo/Dialect/lhlo/IR/lhlo_ops.h"
+#include "llvm/Support/Debug.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/IR/Attributes.h"   // TF:llvm-project
 #include "mlir/IR/Location.h"     // TF:llvm-project
@@ -24,10 +25,11 @@ limitations under the License.
 #include "mlir/IR/SymbolTable.h"  // from @llvm-project
 #include "mlir/IR/TypeUtilities.h"
 #include "mlir/Pass/Pass.h"  // TF:llvm-project
-#include "tensorflow/compiler/mlir/disc/IR/disc_ral_ops.h"
-#include "tensorflow/compiler/mlir/disc/transforms/PassDetail.h"
-#include "tensorflow/compiler/mlir/disc/transforms/placement_utils.h"
-#include "tensorflow/compiler/mlir/xla/ral/compile_metadata.pb.h"
+#include "mlir/disc/IR/disc_ral_ops.h"
+#include "mlir/disc/disc_util.h"
+#include "mlir/disc/transforms/PassDetail.h"
+#include "mlir/disc/transforms/placement_utils.h"
+#include "mlir/ral/ral_metadata.h"
 #include "tensorflow/core/platform/env.h"
 
 namespace mlir {
@@ -35,8 +37,9 @@ namespace disc_ral {
 
 namespace {
 
-using lmhlo::ConstOp;
+using lmhlo::ConstantOp;
 using StrT = SmallString<128>;
+using tao::ral::MetadataFileEmitter;
 
 constexpr static int kMd5DigestLength = 16;
 
@@ -92,44 +95,61 @@ class DiscConstToRALPass : public DiscConstToRALPassBase<DiscConstToRALPass> {
   void runOnOperation() override {
     ModuleOp m = getOperation();
 
-    MetadataProto proto;
-    SmallVector<ConstOp, 4> worklist;
-    m.walk([&](ConstOp op) {
+    MetadataFileEmitter emitter(metadata_file_path_);
+    if (!emitter.emitHeader()) {
+      m.emitError("failed to emit header of metadata file: " +
+                  metadata_file_path_);
+      signalPassFailure();
+      return;
+    }
+
+    SmallVector<ConstantOp, 4> worklist;
+    m.walk([&](ConstantOp op) {
       if (op->getParentOfType<lmhlo::FusionOp>()) {
         return;
       }
+      if (auto func = op->getParentOfType<func::FuncOp>()) {
+        if (func->getAttrOfType<StringAttr>(kFuncCompIntensFusionAttr)) {
+          return;
+        }
+      }
       worklist.push_back(op);
     });
-    for (ConstOp op : worklist) {
-      if (failed(convertConstOp(op, &proto))) {
+    for (ConstantOp op : worklist) {
+      if (failed(convertConstantOp(op, emitter))) {
         m.emitError("convert lmhlo.const to RAL failed");
         signalPassFailure();
         return;
       }
     }
-    auto s = tensorflow::WriteTextProto(tensorflow::Env::Default(),
-                                        metadata_file_path_, proto);
-    if (!s.ok()) {
-      m.emitError("failed to store const file: " + s.error_message());
+
+    if (!emitter.emitTailer()) {
+      m.emitError("failed to emit tailer of metadata file: " +
+                  metadata_file_path_);
       signalPassFailure();
       return;
     }
   }
 
  private:
-  LogicalResult convertConstOp(ConstOp const_op, MetadataProto* proto);
+  LogicalResult convertConstantOp(ConstantOp const_op,
+                                  MetadataFileEmitter& emitter);
 
   int num_processing_const_ops_ = 0;
+  // Map each unique name of const to a unique index. Such indices are used to
+  // reduce the overhead of const lookup at runtime.
+  std::unordered_map<std::string, int> host_name_idx_map_;
+  std::unordered_map<std::string, int> device_name_idx_map_;
 };
 
 // llvm.mlir.global internal constant @unique_name("unique_name\00")
 // %1 = call @ral_constant_cpu/gpu(%ctx, %stream, %unique_name) : () ->
 // memref<...>
-LogicalResult DiscConstToRALPass::convertConstOp(ConstOp const_op,
-                                                 MetadataProto* proto) {
+LogicalResult DiscConstToRALPass::convertConstantOp(
+    ConstantOp const_op, MetadataFileEmitter& emitter) {
   OpBuilder builder(const_op);
   Location loc = const_op.getLoc();
-  DenseElementsAttr valueAttr = const_op.value().cast<DenseElementsAttr>();
+  DenseElementsAttr valueAttr = const_op.getValue().cast<DenseElementsAttr>();
   Type elemType = getElementTypeOrSelf(valueAttr);
 
   // Convert i1 -> i8
@@ -158,16 +178,25 @@ LogicalResult DiscConstToRALPass::convertConstOp(ConstOp const_op,
   std::string data_str = std::string(data);
 
   // save data
-  if (on_host) {
-    (*proto->mutable_host_global_constants())[name_str] = data_str;
-  } else {
-    (*proto->mutable_device_global_constants())[name_str] = data_str;
+  auto name_idx_map = on_host ? &host_name_idx_map_ : &device_name_idx_map_;
+  auto it = name_idx_map->find(name_str);
+  if (it == name_idx_map->end()) {
+    int next_const_idx;
+    if (on_host) {
+      next_const_idx = emitter.getNumHostConstantEmitted();
+      if (!emitter.emitHostConstant(name_str, data_str)) return failure();
+    } else {
+      next_const_idx = emitter.getNumDeviceConstantEmitted();
+      if (!emitter.emitDeviceConstant(name_str, data_str)) return failure();
+    }
+    it = name_idx_map->emplace(std::move(name_str), next_const_idx).first;
   }
 
   std::string symbol_name =
       ("__global_const_" + llvm::Twine(num_processing_const_ops_++)).str();
   Value const_name_global = LLVM::createGlobalString(
-      loc, builder, symbol_name, name, LLVM::Linkage::Internal);
+      loc, builder, symbol_name, name, LLVM::Linkage::Internal,
+      /*TODO:useOpaquePointers=*/false);
 
   ModuleOp m = getOperation();
   MLIRContext* ctx = m.getContext();
@@ -175,9 +204,12 @@ LogicalResult DiscConstToRALPass::convertConstOp(ConstOp const_op,
   Value zero = builder.create<LLVM::ConstantOp>(loc, IntegerType::get(ctx, 32),
                                                 builder.getI32IntegerAttr(0));
   Value stream_idx = builder.create<LLVM::IntToPtrOp>(loc, pointer_type, zero);
-  Value ral_context = const_op->getParentOfType<FuncOp>().getArgument(0);
+  Value ral_context = const_op->getParentOfType<func::FuncOp>().getArgument(0);
+  Value const_idx_value = builder.create<arith::ConstantIntOp>(
+      loc, it->second, builder.getI32Type());
 
-  SmallVector<Value, 12> newOperands{stream_idx, const_name_global};
+  SmallVector<Value, 12> newOperands{stream_idx, const_name_global,
+                                     const_idx_value};
   auto dispatch_op = builder.create<disc_ral::DispatchOp>(
       loc, memref, ral_context, newOperands, "ral_const", false,
       on_host ? "cpu" : "gpu");

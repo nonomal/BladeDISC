@@ -1229,12 +1229,31 @@ REGISTER_XLA_OP_FOR_TAO(Name("Tanh"));
 REGISTER_XLA_OP_FOR_TAO(Name("Real"));
 REGISTER_XLA_OP_FOR_TAO(Name("Imag"));
 
-#if TF_MAJOR_VERSION > 1 || TF_MINOR_VERSION > 12
+#if TF_MAJOR_VERSION > 1 || TF_MAJOR_VERSION==1 && TF_MINOR_VERSION > 12
 REGISTER_XLA_OP_FOR_TAO(Name("AddV2"));
 REGISTER_XLA_OP_FOR_TAO(Name("BatchMatMulV2"));
 REGISTER_XLA_OP_FOR_TAO(Name("FusedBatchNormV3"));
 REGISTER_XLA_OP_FOR_TAO(Name("FusedBatchNormGradV3"));
+REGISTER_XLA_OP_FOR_TAO(Name("SelectV2"));
 #endif // after tf1.12
+
+#if defined(TAO_CPU_ONLY)
+#if TF_MAJOR_VERSION > 2 || TF_MAJOR_VERSION==2 && TF_MINOR_VERSION >= 4
+REGISTER_XLA_OP_FOR_TAO(Name("QuantizeV2"));
+REGISTER_XLA_OP_FOR_TAO(Name("Dequantize"));
+#if defined(TAO_AARCH64)
+// TODO(disc): support `QuantizedConv2DWithBiasAndRequantize` on other platforms
+REGISTER_XLA_OP_FOR_TAO(Name("QuantizedConv2DWithBiasAndRequantize"));
+#endif // TAO_AARCH64
+REGISTER_XLA_OP_FOR_TAO(Name("SparseReshape"));
+REGISTER_XLA_OP_FOR_TAO(Name("SparseFillEmptyRows"));
+REGISTER_XLA_OP_FOR_TAO(Name("SparseSegmentMean"));
+REGISTER_XLA_OP_FOR_TAO(Name("SparseSegmentSum"));
+REGISTER_XLA_OP_FOR_TAO(Name("Where"));
+#endif // TF_VERSION
+#endif // TAO_CPU_ONLY
+
+REGISTER_XLA_OP_FOR_TAO(Name("DiscFakeQuant"));
 
 // clang-format on
 

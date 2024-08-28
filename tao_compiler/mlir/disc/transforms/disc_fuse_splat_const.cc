@@ -18,7 +18,7 @@ limitations under the License.
 // This pass can be regarded as a restricted version of the FusionMerger pass
 // of XLA, dealing with splat const as producer only.
 
-#include "mlir-hlo/Dialect/lhlo/IR/lhlo_ops.h"
+#include "lhlo/IR/lhlo_ops.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/Attributes.h"
 #include "mlir/IR/Builders.h"
@@ -26,7 +26,7 @@ limitations under the License.
 #include "mlir/IR/Location.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/Pass/Pass.h"
-#include "tensorflow/compiler/mlir/disc/transforms/PassDetail.h"
+#include "mlir/disc/transforms/PassDetail.h"
 
 namespace mlir {
 namespace disc_ral {
@@ -41,7 +41,7 @@ class DiscFuseSplatConstPass
 
  private:
   void processSplatConst(
-      lmhlo::ConstOp constant,
+      lmhlo::ConstantOp constant,
       DenseMap<lmhlo::FusionOp, SmallVector<Operation*, 4>> users);
 };
 
@@ -49,18 +49,18 @@ class DiscFuseSplatConstPass
 // step 2, fuse them in to the consumers
 // step 3, if not used anymore, erase the original
 void DiscFuseSplatConstPass::runOnOperation() {
-  FuncOp func = getOperation();
+  func::FuncOp func = getOperation();
   auto* context = &this->getContext();
 
-  SmallVector<lmhlo::ConstOp, 4> worklist;
-  func.walk([&](lmhlo::ConstOp constant) {
-    if (constant.value().isSplat() &&
+  SmallVector<lmhlo::ConstantOp, 4> worklist;
+  func.walk([&](lmhlo::ConstantOp constant) {
+    if (constant.getValue().isSplat() &&
         (constant->getParentOfType<lmhlo::FusionOp>() == nullptr)) {
       worklist.push_back(constant);
     }
   });
   for (auto constant : worklist) {
-    Value memref = constant.output();
+    Value memref = constant.getOutput();
     DenseMap<lmhlo::FusionOp, SmallVector<Operation*, 4>> users;
     // TODO: Support patterns like const -> memref.cast -> lmhlo.xxxop
     for (Operation* user : memref.getUsers()) {
@@ -79,25 +79,26 @@ void DiscFuseSplatConstPass::runOnOperation() {
 }
 
 void DiscFuseSplatConstPass::processSplatConst(
-    lmhlo::ConstOp constant,
+    lmhlo::ConstantOp constant,
     DenseMap<lmhlo::FusionOp, SmallVector<Operation*, 4>> users) {
   for (auto user_item : users) {
     auto orig_alloc =
-        dyn_cast<memref::AllocOp>(constant.output().getDefiningOp());
+        dyn_cast<memref::AllocOp>(constant.getOutput().getDefiningOp());
     if (orig_alloc == nullptr) continue;
     OpBuilder builder(orig_alloc);
     auto new_alloc = builder.clone(*orig_alloc.getOperation());
     Value memref = new_alloc->getResult(0);
-    builder.setInsertionPointToStart(&user_item.first.region().front());
-    builder.create<lmhlo::ConstOp>(constant.getLoc(), constant.value(), memref);
+    builder.setInsertionPointToStart(&user_item.first.getRegion().front());
+    builder.create<lmhlo::ConstantOp>(constant.getLoc(), constant.getValue(),
+                                      memref);
     for (Operation* user : user_item.second) {
-      user->replaceUsesOfWith(constant.output(), memref);
+      user->replaceUsesOfWith(constant.getOutput(), memref);
     }
   }
 
   // Erase the original lmhlo.ConstOp if it has no other users
   bool should_erase = true;
-  for (Operation* user : constant.output().getUsers()) {
+  for (Operation* user : constant.getOutput().getUsers()) {
     if (user == constant.getOperation()) continue;
     should_erase = false;
     break;
@@ -109,7 +110,7 @@ void DiscFuseSplatConstPass::processSplatConst(
 
 }  // namespace
 
-std::unique_ptr<OperationPass<FuncOp>> createDiscFuseSplatConstPass() {
+std::unique_ptr<OperationPass<func::FuncOp>> createDiscFuseSplatConstPass() {
   return std::make_unique<DiscFuseSplatConstPass>();
 }
 

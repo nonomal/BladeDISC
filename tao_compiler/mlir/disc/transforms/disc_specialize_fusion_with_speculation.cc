@@ -12,23 +12,26 @@
 // This file implements the logic for specializing the fusion kernel with
 // speculation.
 
-#include "mlir-hlo/Dialect/lhlo/IR/lhlo_ops.h"
-#include "mlir-hlo/utils/codegen_utils.h"
-#include "mlir/Dialect/SCF/SCF.h"
-#include "mlir/Dialect/StandardOps/IR/Ops.h"  // TF:llvm-project
-#include "mlir/IR/BlockAndValueMapping.h"
+#include "lhlo/IR/lhlo_ops.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/MLIRContext.h"  // TF:llvm-project
 #include "mlir/Pass/Pass.h"       // TF:local_config_mlir
-#include "tensorflow/compiler/mlir/disc/transforms/PassDetail.h"
-#include "tensorflow/compiler/mlir/disc/transforms/codegen_utils.h"
-#include "tensorflow/compiler/mlir/disc/transforms/fusion_utils.h"
-#include "tensorflow/compiler/mlir/disc/transforms/placement_utils.h"
+#include "mlir/disc/disc_util.h"
+#include "mlir/disc/transforms/PassDetail.h"
+#include "mlir/disc/transforms/codegen_utils.h"
+#include "mlir/disc/transforms/fusion_utils.h"
+#include "mlir/disc/transforms/placement_utils.h"
 #include "tensorflow/core/util/env_var.h"
+#include "utils/codegen_utils.h"
 
 namespace mlir {
 namespace disc_ral {
 namespace {
 
+using disc_shape::SymbolicDimOp;
 using lmhlo::DynamicBroadcastInDimOp;
 using lmhlo::FusionOp;
 
@@ -71,7 +74,7 @@ bool IsCandidateBroadcastOp(Operation* op) {
 }
 
 bool HasCandidateBroadcastOp(FusionOp fusion_op) {
-  for (auto& block : fusion_op.region()) {
+  for (auto& block : fusion_op.getRegion()) {
     for (auto& op : block) {
       if (IsCandidateBroadcastOp(&op)) {
         return true;
@@ -81,20 +84,72 @@ bool HasCandidateBroadcastOp(FusionOp fusion_op) {
   return false;
 }
 
-Value createViewLike(OpBuilder& b, Location loc, Value from, Value to) {
-  SmallVector<Value> toShape = getShapeValues(&b, to);
-  auto toType = to.getType().cast<MemRefType>();
-  auto fromType = from.getType().cast<MemRefType>();
-  auto targetType =
-      MemRefType::get(toType.getShape(), fromType.getElementType(),
-                      toType.getLayout(), toType.getMemorySpace());
-  return CastMemRefTo(b, loc, from, targetType, toShape);
+struct ShapeConstraintIRCloneContext {
+  IRMapping valueMapping;
+  DenseMap<Value, SmallVector<SymbolicDimOp>> value2Symbols;
+  DenseMap<SymbolicDimOp, SymbolicDimOp> symbolMapping;
+  SymbolicDimMgr* mgr = nullptr;
+};
+
+FusionOp cloneFusion(OpBuilder& b, FusionOp op,
+                     ShapeConstraintIRCloneContext* ctx = nullptr) {
+  if (ctx == nullptr) {
+    return dyn_cast<FusionOp>(b.clone(*op.getOperation()));
+  }
+
+  SymbolTable& table = ctx->mgr->symbolTable();
+  DenseSet<SymbolicDimOp> originalSymbols;
+  // 1, create a local view of original (dynamic shape) buffers.
+  for (Operation& op : op.getRegion().front()) {
+    for (Value operand : op.getOperands()) {
+      auto ty = operand.getType().dyn_cast<MemRefType>();
+      // skip staitc shape buffers.
+      if (!ty || ty.hasStaticShape()) continue;
+      if (ctx->valueMapping.lookupOrNull(operand)) continue;
+      auto symbols = getMemRefValueSymbolicDimRefs(operand);
+      if (!symbols.has_value()) continue;
+      ctx->valueMapping.map(operand,
+                            createViewLike(b, op.getLoc(), operand, operand));
+      auto& symbolOps = ctx->value2Symbols[operand];
+      for (const auto& sym : *symbols) {
+        auto symOp = table.lookup<SymbolicDimOp>(sym.getValue());
+        assert(symOp);
+        originalSymbols.insert(symOp);
+        symbolOps.push_back(symOp);
+      }
+    }
+  }
+  // 2, clone symbol group
+  auto status = ctx->mgr->cloneSymbolGroup(originalSymbols, ctx->symbolMapping);
+  assert(!failed(status));
+
+  // 3, attach new symbol attrs for the cloned operands.
+  for (const auto& it : ctx->valueMapping.getValueMap()) {
+    auto symIt = ctx->value2Symbols.find(it.first);
+    assert(symIt != ctx->value2Symbols.end());
+    Operation* definingOp = it.second.getDefiningOp();
+    assert(definingOp != nullptr);
+    SmallVector<Attribute> newAttrs;
+    SmallVector<SymbolicDimOp> newSymbols;
+    for (SymbolicDimOp sym : symIt->second) {
+      SymbolicDimOp newSymbol = ctx->symbolMapping[sym];
+      newSymbols.push_back(newSymbol);
+      newAttrs.push_back(FlatSymbolRefAttr::get(newSymbol));
+    }
+    auto symbolicShapeAttr = ArrayAttr::get(op->getContext(), newAttrs);
+    StringRef attrName = disc_shape::SymbolicDimOp::getSymbolicDimAttrName();
+    definingOp->setAttr(attrName, symbolicShapeAttr);
+    ctx->value2Symbols[it.second] = std::move(newSymbols);
+  }
+
+  return dyn_cast<FusionOp>(b.clone(*op.getOperation(), ctx->valueMapping));
 }
 
 FusionOp cloneWithBroadcastSimplifying(
     OpBuilder& b, FusionOp fusion_op,
-    SmallVectorImpl<Operation*>& broadcast_ops) {
-  FusionOp cloned = dyn_cast<FusionOp>(b.clone(*fusion_op.getOperation()));
+    SmallVectorImpl<Operation*>& broadcast_ops,
+    ShapeConstraintIRCloneContext* ctx = nullptr) {
+  FusionOp cloned = cloneFusion(b, fusion_op, ctx);
 
   // Collects all candidate broadcast ops inside the fusion op.
   cloned.walk([&](DynamicBroadcastInDimOp op) {
@@ -113,13 +168,24 @@ FusionOp cloneWithBroadcastSimplifying(
         continue;
       }
       user->replaceUsesOfWith(result, operand);
+      if (ctx != nullptr) {
+        auto lhsIt = ctx->value2Symbols.find(result);
+        auto rhsIt = ctx->value2Symbols.find(operand);
+        if (lhsIt == ctx->value2Symbols.end() ||
+            rhsIt == ctx->value2Symbols.end())
+          continue;
+
+        assert(lhsIt->second.size() == rhsIt->second.size());
+        for (const auto& z : llvm::zip(lhsIt->second, rhsIt->second))
+          ctx->mgr->mapSymbolicDimEqual(std::get<0>(z), std::get<1>(z));
+      }
     }
   }
   return cloned;
 }
 
 Operation* GetCandidateRowReduceOp(FusionOp fusion_op) {
-  for (Block& block : fusion_op.region().getBlocks()) {
+  for (Block& block : fusion_op.getRegion().getBlocks()) {
     for (Operation& op : block) {
       // All row reduce op should have the same shape, thus we can return any
       // of them.
@@ -132,7 +198,7 @@ Operation* GetCandidateRowReduceOp(FusionOp fusion_op) {
 }
 
 Operation* GetCandidateColReduceOp(FusionOp fusion_op) {
-  for (Block& block : fusion_op.region().getBlocks()) {
+  for (Block& block : fusion_op.getRegion().getBlocks()) {
     for (Operation& op : block) {
       // All col reduce op should have the same shape, thus we can return any
       // of them.
@@ -147,9 +213,10 @@ Operation* GetCandidateColReduceOp(FusionOp fusion_op) {
 struct DiscSpecializeFusionWithSpeculationPass
     : public DiscSpecializeFusionWithSpeculationPassBase<
           DiscSpecializeFusionWithSpeculationPass> {
-  DiscSpecializeFusionWithSpeculationPass(int cc_major, int cc_minor) {
-    cc_major_ = cc_major;
-    cc_minor_ = cc_minor;
+  DiscSpecializeFusionWithSpeculationPass(int core_count,
+                                          int max_threads_per_core) {
+    core_count_ = core_count;
+    max_threads_per_core_ = max_threads_per_core;
   }
 
   void getDependentDialects(DialectRegistry& registry) const override {
@@ -175,9 +242,11 @@ struct DiscSpecializeFusionWithSpeculationPass
 
     // Clone the fusion op and mark all candidate broadcast ops within the
     // fusion op.
+    ShapeConstraintIRCloneContext ctx;
+    ctx.mgr = symbolMgr.get();
     SmallVector<Operation*, 4> broadcast_ops;
-    FusionOp cloned =
-        cloneWithBroadcastSimplifying(b, fusion_op, broadcast_ops);
+    FusionOp cloned = cloneWithBroadcastSimplifying(
+        b, fusion_op, broadcast_ops, useShapeConstraintIR() ? &ctx : nullptr);
     addFusionTag(b, cloned, "no_ib");
 
     // Generate the predition.
@@ -197,39 +266,94 @@ struct DiscSpecializeFusionWithSpeculationPass
 
     assert(!broadcast_ops.empty());
 
-    auto if_op = b.create<scf::IfOp>(loc, llvm::None, pred, true);
+    auto if_op = b.create<scf::IfOp>(loc, TypeRange{}, pred, true);
     Block* then_block = &if_op.getThenRegion().getBlocks().front();
     Block* else_block = &if_op.getElseRegion().getBlocks().front();
     cloned.getOperation()->moveBefore(then_block, then_block->begin());
     fusion_op.getOperation()->moveBefore(else_block, else_block->begin());
 
     DenseMap<Value, Value> viewMap;
-    SmallVector<Operation*, 4> op_list;
-    for (Operation& op : cloned.region().front()) op_list.push_back(&op);
-    OpListShapeAnalysis op_list_shape_analysis(op_list);
-    for (Operation* op : op_list) {
-      for (Value operand : op->getOperands()) {
-        if (viewMap.find(operand) != viewMap.end()) continue;
-        Value leader =
-            op_list_shape_analysis.GetLeaderValueWithSameShape(operand);
-        if (!leader || leader == operand) continue;
-        // TODO(disc): handle mismatch type case
-        auto leaderTy = leader.getType().dyn_cast<MemRefType>();
-        auto operandTy = operand.getType().dyn_cast<MemRefType>();
-        if (!leaderTy || !operandTy ||
-            leaderTy.getRank() != operandTy.getRank())
-          continue;
-        bool sameShape = true;
-        for (auto&& en : llvm::zip(leaderTy.getShape(), operandTy.getShape())) {
-          if (std::get<0>(en) != std::get<1>(en)) {
-            sameShape = false;
-            break;
+    if (useShapeConstraintIR()) {
+      OpBuilder viewBuilder(cloned);
+      // build symbolicDimOp to its corresponding SSA value map
+      DenseMap<SymbolicDimOp, Value> symbolicDim2SSAValue;
+      for (Operation& op : cloned.getRegion().front()) {
+        for (Value operand : op.getOperands()) {
+          auto it = ctx.value2Symbols.find(operand);
+          if (it == ctx.value2Symbols.end()) continue;
+          for (const auto& en : llvm::enumerate(it->second)) {
+            SymbolicDimOp rootSym = ctx.mgr->getRootSymbolicDim(en.value());
+            if (en.value() != rootSym) continue;
+            if (rootSym.isDynamic()) {
+              symbolicDim2SSAValue[rootSym] = viewBuilder.create<memref::DimOp>(
+                  op.getLoc(), operand, en.index());
+            } else {
+              symbolicDim2SSAValue[rootSym] =
+                  viewBuilder.create<arith::ConstantIndexOp>(
+                      op.getLoc(), rootSym.getDimSize());
+            }
           }
         }
-        if (!sameShape) continue;
-        OpBuilder viewBuilder(cloned);
-        viewMap[operand] =
-            createViewLike(viewBuilder, op->getLoc(), operand, leader);
+      }
+
+      for (Operation& op : cloned.getRegion().front()) {
+        for (Value operand : op.getOperands()) {
+          if (viewMap.find(operand) != viewMap.end()) continue;
+          auto it = ctx.value2Symbols.find(operand);
+          if (it == ctx.value2Symbols.end()) continue;
+          SmallVector<int64_t> newShape;
+          SmallVector<Value> newShapeValues;
+          SmallVector<Attribute> newAttrs;
+          for (SymbolicDimOp sym : it->second) {
+            SymbolicDimOp rootSym = ctx.mgr->getRootSymbolicDim(sym);
+            newAttrs.push_back(FlatSymbolRefAttr::get(rootSym));
+            newShapeValues.push_back(symbolicDim2SSAValue[rootSym]);
+            newShape.push_back(rootSym.isDynamic() ? ShapedType::kDynamic
+                                                   : rootSym.getDimSize());
+          }
+          auto oldType = operand.getType().cast<MemRefType>();
+          auto newType =
+              MemRefType::get(newShape, oldType.getElementType(),
+                              oldType.getLayout(), oldType.getMemorySpace());
+          // TODO(disc): handle mismatch type case
+          if (newType != oldType) continue;
+          viewMap[operand] = CastMemRefTo(viewBuilder, op.getLoc(), operand,
+                                          newType, newShapeValues);
+          auto symbolicShapeAttr = ArrayAttr::get(op.getContext(), newAttrs);
+          StringRef attrName = SymbolicDimOp::getSymbolicDimAttrName();
+          viewMap[operand].getDefiningOp()->setAttr(attrName,
+                                                    symbolicShapeAttr);
+        }
+      }
+    } else {
+      SmallVector<Operation*, 4> op_list;
+      for (Operation& op : cloned.getRegion().front()) op_list.push_back(&op);
+      OpListShapeAnalysis op_list_shape_analysis(op_list);
+      for (Operation* op : op_list) {
+        for (Value operand : op->getOperands()) {
+          if (viewMap.find(operand) != viewMap.end()) continue;
+          Value leader =
+              op_list_shape_analysis.GetLeaderValueWithSameShape(operand);
+          if (!leader || leader == operand) continue;
+          // TODO(disc): handle mismatch type case
+          auto leaderTy = leader.getType().dyn_cast<MemRefType>();
+          auto operandTy = operand.getType().dyn_cast<MemRefType>();
+          if (!leaderTy || !operandTy ||
+              leaderTy.getRank() != operandTy.getRank())
+            continue;
+          bool sameShape = true;
+          for (auto&& en :
+               llvm::zip(leaderTy.getShape(), operandTy.getShape())) {
+            if (std::get<0>(en) != std::get<1>(en)) {
+              sameShape = false;
+              break;
+            }
+          }
+          if (!sameShape) continue;
+          OpBuilder viewBuilder(cloned);
+          viewMap[operand] =
+              createViewLike(viewBuilder, op->getLoc(), operand, leader);
+        }
       }
     }
 
@@ -265,34 +389,45 @@ struct DiscSpecializeFusionWithSpeculationPass
     Value operand = reduce_op->getOperand(0);
     // TODO(disc): Use 256 as default block size; turn this number for
     // different shapes
-    int block_size = kThreadsRowReduction;
+    int block_size = kCTASizeDefault;
     Value col_size = b.create<memref::DimOp>(loc, operand, 1);
     Value pred;
 
-    auto thread_number_info =
-        ArchToGPUThreadNumber.find({cc_major_, cc_minor_});
-    if (thread_number_info != ArchToGPUThreadNumber.end()) {
-      // Enhanced schedule selection policy is as following:
-      //   1. use schedule 1 if
-      //      (col-size >= block-dim) &&
-      //      (row-number / row-per-block-in-sched-2 < max-blocks-per-wave / 2);
-      //   2. use schedule 2 otherwise.
-      const auto& info = thread_number_info->second;
-      int64_t sm_number = info.first;
-      int64_t max_threads_per_wave_per_sm = info.second;
-      int64_t max_blocks_per_wave =
-          max_threads_per_wave_per_sm / block_size * sm_number;
-      int64_t row_per_block_in_sched_2 = block_size / kWarpSize;
+    // TODO: this feature will be experimental in the first release, and will be
+    // set as default in the near future after evaluated on benchmarks.
+    if (isMemIntensiveOptExperimentalEnabled() && core_count_ != -1 &&
+        max_threads_per_core_ != -1) {
+      // When the number of rows is small or the number of cols is large, we
+      // use one-block-one-row schedule. Specifically, we use one-block-one-row
+      // schedule for the following conditions (otherwise use one-warp-one-row
+      // schedule):
+      //   1. row < max-warps-per-wave / 4
+      //   2. row < max-warps-per-wave / 2 & col >= 1024
+      //   3. row >= max-warps-per-wave / 2 & cols >= 512
+      // Note the block-size is 256 currently.
+      int64_t max_warps_per_wave =
+          max_threads_per_core_ / block_size * core_count_ / kWarpSize;
       Value row_size = b.create<memref::DimOp>(loc, operand, 0);
-      Value block_size_val = b.create<arith::ConstantIndexOp>(loc, block_size);
-      auto threshold_row_number = b.create<arith::ConstantIndexOp>(
-          loc, max_blocks_per_wave / 2 * row_per_block_in_sched_2);
-      Value large_col = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sge,
-                                                col_size, block_size_val);
-      Value small_row = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt,
-                                                row_size, threshold_row_number);
-
-      pred = b.create<arith::AndIOp>(loc, large_col, small_row);
+      Value col_size = b.create<memref::DimOp>(loc, operand, 1);
+      Value cond1 = b.create<arith::CmpIOp>(
+          loc, arith::CmpIPredicate::slt, row_size,
+          b.create<arith::ConstantIndexOp>(loc, max_warps_per_wave / 4));
+      Value cond2 = b.create<arith::AndIOp>(
+          loc,
+          b.create<arith::CmpIOp>(
+              loc, arith::CmpIPredicate::slt, row_size,
+              b.create<arith::ConstantIndexOp>(loc, max_warps_per_wave / 2)),
+          b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sge, col_size,
+                                  b.create<arith::ConstantIndexOp>(loc, 1024)));
+      Value cond3 = b.create<arith::AndIOp>(
+          loc,
+          b.create<arith::CmpIOp>(
+              loc, arith::CmpIPredicate::sge, row_size,
+              b.create<arith::ConstantIndexOp>(loc, max_warps_per_wave / 2)),
+          b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sge, col_size,
+                                  b.create<arith::ConstantIndexOp>(loc, 512)));
+      pred = b.create<arith::OrIOp>(loc, cond1, cond2);
+      pred = b.create<arith::OrIOp>(loc, pred, cond3);
     } else {
       // Default schedule selection policy:
       //   use schedule 1 if col size > `kRowReductionScheduleTurningSize`;
@@ -303,16 +438,16 @@ struct DiscSpecializeFusionWithSpeculationPass
                                      ref_size);
     }
 
-    auto if_op = b.create<scf::IfOp>(loc, llvm::None, pred, true);
+    auto if_op = b.create<scf::IfOp>(loc, TypeRange{}, pred, true);
 
     auto first_schedule = b.getIntegerAttr(b.getIntegerType(32), 1);
     auto second_schedule = b.getIntegerAttr(b.getIntegerType(32), 2);
     auto num_thread_attr = b.getIntegerAttr(b.getIntegerType(32), block_size);
-    fusion_op->setAttr(kThreadPerBlockHint, num_thread_attr);
+    fusion_op->setAttr(kCTASizeHint, num_thread_attr);
     fusion_op->setAttr(kRowReductionScheduleHint, first_schedule);
     // one block one row
     addFusionTag(b, fusion_op, "1b1r");
-    cloned->setAttr(kThreadPerBlockHint, num_thread_attr);
+    cloned->setAttr(kCTASizeHint, num_thread_attr);
     cloned->setAttr(kRowReductionScheduleHint, second_schedule);
     // one warp one row
     addFusionTag(b, cloned, "1w1r");
@@ -326,7 +461,19 @@ struct DiscSpecializeFusionWithSpeculationPass
   // TODO(feiwen): add more kTileW=8/kTileH pairs by if/elseif/else
   void DoColReductionSpeculation(FusionOp fusion_op) {
     // We only do specialization fusion op on GPU a.t.m.
+    bool use_new = false;
+    static const char* env = getenv("NEW_COL");
+    if (env != nullptr) {
+      use_new = std::string(env) == "1" || std::string(env) == "2" ||
+                std::string(env) == "4" || std::string(env) == "8";
+    }
+
     if (!placement_utils::isGpuMhlo(fusion_op)) {
+      return;
+    }
+
+    if ((core_count_ == -1 || max_threads_per_core_ == -1) && (!use_new)) {
+      // Do not know about device information.
       return;
     }
 
@@ -339,8 +486,6 @@ struct DiscSpecializeFusionWithSpeculationPass
       return;
     }
 
-    // Col reduction schedule selection policy: if blocks > 80, use schedule
-    // kTileW=8/kTileH=32; or use schedule kTileW=8/kTileH=8.
     OpBuilder b(fusion_op);
     Location loc = fusion_op.getLoc();
     FusionOp cloned = dyn_cast<FusionOp>(b.clone(*fusion_op.getOperation()));
@@ -348,41 +493,42 @@ struct DiscSpecializeFusionWithSpeculationPass
     Value operand = reduce_op->getOperand(0);
     Value row_size = b.create<memref::DimOp>(loc, operand, 0);
     Value col_size = b.create<memref::DimOp>(loc, operand, 1);
+
     Value matrix_size = b.create<arith::MulIOp>(loc, row_size, col_size);
-    int thread_per_block = 256;
+    int thread_per_block = kCTASizeDefault;
     Value cur_threads = b.create<arith::ConstantIndexOp>(loc, thread_per_block);
+    // b.create<arith::ConstantIndexOp>(loc, max_threads_per_block_);
     Value cur_blocks =
         b.create<arith::CeilDivSIOp>(loc, matrix_size, cur_threads);
-    int sm_num;
-    auto thread_number_info =
-        ArchToGPUThreadNumber.find({cc_major_, cc_minor_});
-    if (thread_number_info != ArchToGPUThreadNumber.end()) {
-      auto info = thread_number_info->second;
-      sm_num = info.first;
-    } else {
-      sm_num = 80;  // Default is the data of V100.
-    }
-    Value ref_blocks = b.create<arith::ConstantIndexOp>(loc, sm_num);
+    Value ref_blocks = b.create<arith::ConstantIndexOp>(loc, core_count_);
 
-    Value pred = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt,
-                                         cur_blocks, ref_blocks);
+    // Schedule selection policy:
+    // when the shape of matrix is flat(row > col), we use the first schedule.
+    // Otherwise, we use the second schedule. The conditions are as follows:
+    //   1. row < col
+    //   2. row >= col
+    Value pred = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt,
+                                         row_size, col_size);
+    auto if_op = b.create<scf::IfOp>(loc, TypeRange{}, pred, true);
 
-    auto if_op = b.create<scf::IfOp>(loc, llvm::None, pred, true);
-
-    auto w8_h32_schedule =
-        b.getIntegerAttr(b.getIntegerType(32), DISC_TILE_W8_H32);
-    auto w8_h16_schedule =
-        b.getIntegerAttr(b.getIntegerType(32), DISC_TILE_W8_H16);
-    auto num_thread_256_attr = b.getIntegerAttr(b.getIntegerType(32), 256);
-    auto num_thread_128_attr = b.getIntegerAttr(b.getIntegerType(32), 128);
-    fusion_op->setAttr(kThreadPerBlockHint, num_thread_256_attr);
-    fusion_op->setAttr(kColReductionScheduleHint, w8_h32_schedule);
-    // use 8*32 tile if block# >= SM#
-    addFusionTag(b, fusion_op, "8w32h");
-    cloned->setAttr(kThreadPerBlockHint, num_thread_128_attr);
-    cloned->setAttr(kColReductionScheduleHint, w8_h16_schedule);
-    // one 8*16 tile if block# < SM#
-    addFusionTag(b, cloned, "8w16h");
+    auto first_schedule =
+        b.getIntegerAttr(b.getIntegerType(32), DISC_THREAD_TILE_H32);
+    auto second_schedule =
+        b.getIntegerAttr(b.getIntegerType(32), DISC_BLOCK_TILE_H64);
+    //  block-size is 256 in the second schedule
+    auto num_thread_full_attr256 =
+        b.getIntegerAttr(b.getIntegerType(32), kCTASizeDefault);
+    // block-size is 512 in the first schedule
+    auto num_thread_full_attr512 =
+        b.getIntegerAttr(b.getIntegerType(32), kCTASize512);
+    fusion_op->setAttr(kCTASizeHint, num_thread_full_attr512);
+    fusion_op->setAttr(kColReductionScheduleHint, first_schedule);
+    // use fisrt schedule if row_size < col_size
+    addFusionTag(b, fusion_op, "thread_tile_h32");
+    cloned->setAttr(kCTASizeHint, num_thread_full_attr256);
+    cloned->setAttr(kColReductionScheduleHint, second_schedule);
+    // use second schedule if row_size >= col_size
+    addFusionTag(b, cloned, "block_tile_h64");
 
     Block* then_block = &if_op.getThenRegion().getBlocks().front();
     Block* else_block = &if_op.getElseRegion().getBlocks().front();
@@ -395,19 +541,45 @@ struct DiscSpecializeFusionWithSpeculationPass
       return;
     }
 
-    // Already have a hint
-    if (fusion_op->getAttrOfType<IntegerAttr>(kVectorizeOrTileHint)) return;
-
-    FusionType fusion_type = getFusionType(fusion_op.getOperation());
-    if (fusion_type != FusionType::kLoop &&
-        fusion_type != FusionType::kRowReduction &&
-        fusion_type != FusionType::kStitch) {
+    if (core_count_ == -1 || max_threads_per_core_ == -1) {
+      // Do not know about device information.
       return;
     }
 
+    // Already have a hint
+    if (fusion_op->getAttrOfType<IntegerAttr>(kVectorizeOrTileHint)) return;
+
+    bool enable_mem_intensive_opt_expreimental =
+        isMemIntensiveOptExperimentalEnabled();
+    FusionType fusion_type = getFusionType(fusion_op.getOperation());
+    if (fusion_type != FusionType::kLoop &&
+        fusion_type != FusionType::kRowReduction &&
+        (fusion_type != FusionType::kStitch ||
+         (fusion_type == FusionType::kStitch &&
+          enable_mem_intensive_opt_expreimental))) {
+      // TODO: support tile optimization for kStitch fusion when
+      // `DISC_MEM_INTENSIVE_OPT_EXPERIMENTAL` is `true`.
+      return;
+    }
+
+    // When 'MemIntensiveOptExperimental' is enabled, the vecotrization of
+    // concatenate operator will peform a bad case on bert model.
+    // Skip optimization of concatenate operator here.
+    FusionPatternBase fusion_pattern(fusion_op);
+    bool contain_concatenate = false;
+    // Currently, skip `enable_mem_intensive_opt_expreimental` if the fusion
+    // contains concatenate operator.
+    for (auto op : fusion_pattern.getOpList()) {
+      if (isa<lmhlo::ConcatenateOp>(op)) {
+        contain_concatenate = true;
+        break;
+      }
+    }
+    enable_mem_intensive_opt_expreimental &= !contain_concatenate;
+
     // TODO: aware of row-reduction hints.
 
-    // Vectorization/tiling policy:
+    // Default vectorization/tiling policy:
     //
     // 1) No vectorization/Tiling.
     //     - dominanted by column reduction (codegen support now). TODO: add
@@ -419,25 +591,16 @@ struct DiscSpecializeFusionWithSpeculationPass
     // 2) Otherwise apply vectorization/tiling with width of
     //    `kVectorizeOrTileSize`, which is 2 currently.
 
-    int max_threads_per_wave;
-    auto thread_number_info =
-        ArchToGPUThreadNumber.find({cc_major_, cc_minor_});
-    if (thread_number_info != ArchToGPUThreadNumber.end()) {
-      auto info = thread_number_info->second;
-      max_threads_per_wave = info.first * info.second;
-    } else {
-      max_threads_per_wave = 40 * 1024;  // Default is the data of T4.
-    }
-
     OpBuilder b(fusion_op);
     Location loc = fusion_op.getLoc();
 
-    Value out_element_number;
-    Value threshold;
+    Value pred;
+    int max_threads_per_wave = core_count_ * max_threads_per_core_;
+    int vector_size = kVectorizeOrTileSize;
     if (fusion_type == FusionType::kRowReduction ||
         fusion_type == FusionType::kStitch) {
       Operation* dominant_equivalent_op = GetCandidateRowReduceOp(fusion_op);
-      auto block_size = getThreadPerBlock(fusion_op.getOperation());
+      auto block_size = getCTASize(fusion_op.getOperation());
 
       int rowred_schedule =
           getRowReductionScheduleHint(fusion_op.getOperation());
@@ -447,38 +610,66 @@ struct DiscSpecializeFusionWithSpeculationPass
                                : 1;
       auto max_rows_per_wave =
           max_threads_per_wave / block_size * row_per_block;
-      threshold = b.create<arith::ConstantIndexOp>(loc, max_rows_per_wave);
+      Value threshold =
+          b.create<arith::ConstantIndexOp>(loc, max_rows_per_wave);
       Value operand = dominant_equivalent_op->getOperand(0);
       // #out-element is row numbers.
-      out_element_number = b.create<memref::DimOp>(loc, operand, 0);
+      Value out_element_number = b.create<memref::DimOp>(loc, operand, 0);
+
+      Value larger = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt,
+                                             out_element_number, threshold);
+      Value divisible = b.create<arith::CmpIOp>(
+          loc, arith::CmpIPredicate::eq,
+          b.create<arith::RemUIOp>(
+              loc, out_element_number,
+              b.create<arith::ConstantIndexOp>(loc, vector_size)),
+          b.create<arith::ConstantIndexOp>(loc, 0));
+      pred = b.create<arith::AndIOp>(loc, larger, divisible);
     } else if (fusion_type == FusionType::kLoop) {
-      threshold = b.create<arith::ConstantIndexOp>(loc, max_threads_per_wave);
-      FusionPatternBase fusion_pattern(fusion_op);
       Operation* dominant_equivalent_op = fusion_pattern.getRootOps().back();
-      out_element_number =
+      Value out_element_number =
           emitNumElementsComputation(b, loc, dominant_equivalent_op);
+      if (enable_mem_intensive_opt_expreimental) {
+        // Maximize the vector-size according to data type of all outputs. The
+        // maximum vector-size is 8 (128 / 16).
+        auto& results = fusion_pattern.getResults();
+        const int gpu_vector_width = 128;
+        int min_bits = gpu_vector_width;
+        for (auto result : results) {
+          auto memref_ty = result.getType().cast<MemRefType>();
+          int byte_width = memref_ty.getElementTypeBitWidth();
+          min_bits = std::min(byte_width, min_bits);
+        }
+        // The minimum bit-width for vector-size calculation is 16.
+        min_bits = std::max(min_bits, 16);
+        assert(gpu_vector_width % min_bits == 0);
+        vector_size = gpu_vector_width / min_bits;
+      }
+      Value divisible = b.create<arith::CmpIOp>(
+          loc, arith::CmpIPredicate::eq,
+          b.create<arith::RemUIOp>(
+              loc, out_element_number,
+              b.create<arith::ConstantIndexOp>(loc, vector_size)),
+          b.create<arith::ConstantIndexOp>(loc, 0));
+      if (enable_mem_intensive_opt_expreimental) {
+        pred = divisible;
+      } else {
+        Value threshold =
+            b.create<arith::ConstantIndexOp>(loc, max_threads_per_wave);
+        Value larger = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt,
+                                               out_element_number, threshold);
+        pred = b.create<arith::AndIOp>(loc, larger, divisible);
+      }
     } else {
       // Either a column reduction dominanted fusion, or a non-fusion op.
       return;
     }
 
-    Value larger = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt,
-                                           out_element_number, threshold);
-    Value is_even = b.create<arith::CmpIOp>(
-        loc, arith::CmpIPredicate::eq,
-        b.create<arith::RemUIOp>(
-            loc, out_element_number,
-            b.create<arith::ConstantIndexOp>(loc, kVectorizeOrTileSize)),
-        b.create<arith::ConstantIndexOp>(loc, 0));
-    Value pred = b.create<arith::AndIOp>(loc, larger, is_even);
-    auto if_op = b.create<scf::IfOp>(loc, llvm::None, pred, true);
+    auto if_op = b.create<scf::IfOp>(loc, TypeRange{}, pred, true);
 
     // Vectorization/tiling branch.
-    auto vec_tile =
-        b.getIntegerAttr(b.getIntegerType(32), kVectorizeOrTileSize);
+    auto vec_tile = b.getIntegerAttr(b.getIntegerType(32), vector_size);
     fusion_op->setAttr(kVectorizeOrTileHint, vec_tile);
-    addFusionTag(b, fusion_op,
-                 "_vectile" + std::to_string(kVectorizeOrTileSize));
     Block* then_block = &if_op.getThenRegion().getBlocks().front();
     fusion_op.getOperation()->moveBefore(then_block, then_block->begin());
 
@@ -486,9 +677,11 @@ struct DiscSpecializeFusionWithSpeculationPass
     FusionOp cloned = dyn_cast<FusionOp>(b.clone(*fusion_op.getOperation()));
     auto no_vec_tile = b.getIntegerAttr(b.getIntegerType(32), 1);
     cloned->setAttr(kVectorizeOrTileHint, no_vec_tile);
-    addFusionTag(b, cloned, "_no_vectile");
     Block* else_block = &if_op.getElseRegion().getBlocks().front();
     cloned.getOperation()->moveBefore(else_block, else_block->begin());
+
+    // Add tag for vectorized op after it is cloned.
+    addFusionTag(b, fusion_op, "Vec" + std::to_string(vector_size));
   }
 
   void Speculator(
@@ -511,6 +704,22 @@ struct DiscSpecializeFusionWithSpeculationPass
   }
 
   void runOnOperation() override {
+    if (useShapeConstraintIR()) {
+      func::FuncOp func = getOperation();
+      // skip shape constraint graph
+      if (func.getName() ==
+          SymbolicDimMgr::getShapeConstraintGraphFunctionName())
+        return;
+
+      auto m = func->getParentOfType<ModuleOp>();
+      symbolMgr.reset(new SymbolicDimMgr(m));
+      if (failed(symbolMgr->load())) {
+        getOperation()->emitError() << "fail to load shape constraint IR\n";
+        signalPassFailure();
+        return;
+      }
+    }
+
     // Stage #1: broadcast simplifier with speculation.
     Speculator(
         &DiscSpecializeFusionWithSpeculationPass::DoBroadcastSpeculation);
@@ -528,15 +737,26 @@ struct DiscSpecializeFusionWithSpeculationPass
     // Stage #4: speculation of vectorization/tiling.
     Speculator(
         &DiscSpecializeFusionWithSpeculationPass::DoVectorizeOrTileSpeculation);
+
+    if (useShapeConstraintIR()) {
+      if (failed(symbolMgr->save())) {
+        getOperation()->emitError() << "fail to load shape constraint IR\n";
+        signalPassFailure();
+        return;
+      }
+    }
   }
+
+  std::shared_ptr<SymbolicDimMgr> symbolMgr;
 };
 
 }  // namespace
 
-std::unique_ptr<OperationPass<FuncOp>>
-createDiscSpecializeFusionWithSpeculationPass(int cc_major, int cc_minor) {
-  return std::make_unique<DiscSpecializeFusionWithSpeculationPass>(cc_major,
-                                                                   cc_minor);
+std::unique_ptr<OperationPass<func::FuncOp>>
+createDiscSpecializeFusionWithSpeculationPass(int core_count,
+                                              int max_threads_per_core) {
+  return std::make_unique<DiscSpecializeFusionWithSpeculationPass>(
+      core_count, max_threads_per_core);
 }
 
 }  // namespace disc_ral
